@@ -24,6 +24,7 @@ class Primitive(NamedTuple):
 
 add_p = Primitive('add')
 mul_p = Primitive('mul')
+div_p = Primitive('div')
 neg_p = Primitive("neg")
 sin_p = Primitive("sin")
 cos_p = Primitive("cos")
@@ -38,6 +39,7 @@ argmax_p = Primitive("argmax")
 
 def add(x, y): return bind1(add_p, x, y)
 def mul(x, y): return bind1(mul_p, x, y)
+def div(x, y): return bind1(div_p, x, y)
 def neg(x): return bind1(neg_p, x)
 def sin(x): return bind1(sin_p, x)
 def cos(x): return bind1(cos_p, x)
@@ -107,6 +109,7 @@ impl_rules = {}
 
 impl_rules[add_p] = lambda x, y: [np.add(x, y)]
 impl_rules[mul_p] = lambda x, y: [np.multiply(x, y)]
+impl_rules[div_p] = lambda x, y: [np.divide(x, y)]
 impl_rules[neg_p] = lambda x: [np.negative(x)]
 impl_rules[sin_p] = lambda x: [np.sin(x)]
 impl_rules[cos_p] = lambda x: [np.cos(x)]
@@ -363,6 +366,11 @@ def mul_jvp(primals, tangents):
   (x, y), (x_dot, y_dot) = primals, tangents
   return [x * y], [x_dot * y + x * y_dot]
 jvp_rules[mul_p] = mul_jvp
+
+def div_jvp(primals, tangents):
+  (x, y), (x_dot, y_dot) = primals, tangents
+  return [x * y], [x_dot * y + x * y_dot]
+jvp_rules[div_p] = div_jvp
 
 def sin_jvp(primals, tangents):
   (x,), (x_dot,) = primals, tangents
@@ -665,6 +673,7 @@ def binop_batching_rule(op, axis_size, vals_in, dims_in):
   return [op(x, y)], [x_bdim]
 vmap_rules[add_p] = partial(binop_batching_rule, add)
 vmap_rules[mul_p] = partial(binop_batching_rule, mul)
+vmap_rules[div_p] = partial(binop_batching_rule, div)
 
 def vectorized_unop_batching_rule(op, axis_size, vals_in, dims_in):
   (x,), (x_bdim,) = vals_in, dims_in
@@ -1061,6 +1070,7 @@ def binop_abstract_eval(x: ShapedArray, y: ShapedArray) -> List[ShapedArray]:
 
 abstract_eval_rules[add_p] = binop_abstract_eval
 abstract_eval_rules[mul_p] = binop_abstract_eval
+abstract_eval_rules[div_p] = binop_abstract_eval
 
 def compare_abstract_eval(x: ShapedArray, y: ShapedArray) -> List[ShapedArray]:
   if not isinstance(x, ShapedArray) or not isinstance(y, ShapedArray):
@@ -1492,6 +1502,7 @@ def direct_translation(op, c, in_avals, in_vals):
 
 # xla_translations[add_p] = partial(direct_translation, xops.Add)
 # xla_translations[mul_p] = partial(direct_translation, xops.Mul)
+# xla_translations[div_p] = partial(direct_translation, xops.Div)
 # xla_translations[neg_p] = partial(direct_translation, xops.Neg)
 # xla_translations[sin_p] = partial(direct_translation, xops.Sin)
 # xla_translations[cos_p] = partial(direct_translation, xops.Cos)
@@ -2404,6 +2415,12 @@ def mul_transpose_rule(cts, x, y):
   assert (type(x) is UndefPrimal) ^ (type(y) is UndefPrimal)
   return [mul(z_bar, y), None] if type(x) is UndefPrimal else [None, mul(x, z_bar)]
 transpose_rules[mul_p] = mul_transpose_rule
+
+def div_transpose_rule(cts, x, y):
+  z_bar, = cts
+  assert (type(x) is UndefPrimal) ^ (type(y) is UndefPrimal)
+  return [div(z_bar, y), None] if type(x) is UndefPrimal else [None, div(x, z_bar)]
+transpose_rules[div_p] = div_transpose_rule
 
 def neg_transpose_rule(cts, x):
   ybar, = cts
