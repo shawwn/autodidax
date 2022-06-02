@@ -1,5 +1,7 @@
 from typing import NamedTuple
 
+print = lambda *args: None
+
 class Primitive(NamedTuple):
   name: str
 
@@ -373,3 +375,328 @@ def jvp_v1(f, primals, tangents):
     tracer_out = full_raise(trace, out)
     primal_out, tangent_out = tracer_out.primal, tracer_out.tangent
   return primal_out, tangent_out
+
+# -
+
+# ## Pytrees and flattening user functions' inputs and outputs
+
+# A limitation with `jvp_v1` is that it assumes the user function accepts arrays
+# as positional arguments and produces a single array as output. What if it
+# produced a list as output? Or accepted nested containers as inputs? It would
+# be a pain to deal with all the possible containers in inputs and outputs at
+# every layer of the stack. Instead, we can wrap the user function so that the
+# wrapped version accepts arrays as inputs and returns a flat list of arrays as
+# output. The wrapper just needs to unflatten its input, call the user function,
+# and flatten the output.
+#
+# Here's how we'd like to write `jvp`, assuming the user always gives us
+# functions that take arrays as inputs and produces a flat list of arrays as
+# outputs:
+
+def jvp_flat(f, primals, tangents):
+  with new_main(JVPTrace) as main:
+    trace = JVPTrace(main)
+    tracers_in = [JVPTracer(trace, x, t) for x, t in zip(primals, tangents)]
+    outs = f(*tracers_in)
+    tracers_out = [full_raise(trace, out) for out in outs]
+    primals_out, tangents_out = unzip2((t.primal, t.tangent) for t in tracers_out)
+  return primals_out, tangents_out
+
+
+# To support user functions that have arbitrary containers in the inputs and
+# outputs, here's how we'd write the user-facing `jvp` wrapper:
+
+def jvp(f, primals, tangents):
+  primals_flat, in_tree = tree_flatten(primals)
+  tangents_flat, in_tree2 = tree_flatten(tangents)
+  if in_tree != in_tree2: raise TypeError
+  f, out_tree = flatten_fun(f, in_tree)
+  primals_out_flat, tangents_out_flat = jvp_flat(f, primals_flat, tangents_flat)
+  primals_out = tree_unflatten(out_tree(), primals_out_flat)
+  tangents_out = tree_unflatten(out_tree(), tangents_out_flat)
+  return primals_out, tangents_out
+
+
+# Notice that we had to plumb the tree structure of the user function output
+# back to the caller of `flatten_fun`. That information isn't available until we
+# actually run the user function, so `flatten_fun` just returns a reference to a
+# mutable cell, represented as a thunk. These side-effects are safe because we
+# always run the user function exactly once. (This safe regime is the reason for
+# the "linear" name in `linear_util.py`, in the sense of [linear
+# types](https://en.wikipedia.org/wiki/Substructural_type_system).)
+#
+# All that remains is to write `tree_flatten`, `tree_unflatten`, and
+# `flatten_fun`.
+
+# + tags=["hide-input"]
+def flatten_fun(f, in_tree):
+  store = Store()
+
+  def flat_fun(*args_flat):
+    pytree_args = tree_unflatten(in_tree, args_flat)
+    out = f(*pytree_args)
+    out_flat, out_tree = tree_flatten(out)
+    store.set_value(out_tree)
+    return out_flat
+
+  return flat_fun, store
+
+class Empty: pass
+empty = Empty()
+
+class Store:
+  val = empty
+
+  def set_value(self, val):
+    assert self.val is empty
+    self.val = val
+
+  def __call__(self):
+    return self.val
+
+
+# + tags=["hide-input"]
+import itertools as it
+from typing import Callable, Type, Hashable, Dict, Iterable, Iterator
+
+class NodeType(NamedTuple):
+  name: str
+  to_iterable: Callable
+  from_iterable: Callable
+
+def register_pytree_node(ty: Type, to_iter: Callable, from_iter: Callable
+                         ) -> None:
+  node_types[ty] = NodeType(str(ty), to_iter, from_iter)
+
+node_types: Dict[Type, NodeType] = {}
+register_pytree_node(tuple, lambda t: (None, t), lambda _, xs: tuple(xs))
+register_pytree_node(list,  lambda l: (None, l), lambda _, xs:  list(xs))
+register_pytree_node(dict,
+                     lambda d: map(tuple, unzip2(sorted(d.items()))),
+                     lambda keys, vals: dict(zip(keys, vals)))
+
+class PyTreeDef(NamedTuple):
+  node_type: NodeType
+  node_metadata: Hashable
+  child_treedefs: Tuple['PyTreeDef']
+
+class Leaf: pass
+leaf = Leaf()
+
+def tree_flatten(x: Any) -> Tuple[List[Any], PyTreeDef]:
+  children_iter, treedef = _tree_flatten(x)
+  return list(children_iter), treedef
+
+def _tree_flatten(x: Any) -> Tuple[Iterable, PyTreeDef]:
+  node_type = node_types.get(type(x))
+  if node_type:
+    node_metadata, children = node_type.to_iterable(x)
+    children_flat, child_trees = unzip2(map(_tree_flatten, children))
+    flattened = it.chain.from_iterable(children_flat)
+    return flattened, PyTreeDef(node_type, node_metadata, tuple(child_trees))
+  else:
+    return [x], leaf
+
+def tree_unflatten(treedef: PyTreeDef, xs: List[Any]) -> Any:
+  return _tree_unflatten(treedef, iter(xs))
+
+def _tree_unflatten(treedef: PyTreeDef, xs: Iterator) -> Any:
+  if treedef is leaf:
+    return next(xs)
+  else:
+    children = (_tree_unflatten(t, xs) for t in treedef.child_treedefs)
+    return treedef.node_type.from_iterable(treedef.node_metadata, children)
+
+
+# -
+
+# With this pytree-handling `jvp` implementation, we can now handle arbitrary
+# input and output containers. That'll come in handy with future transformations
+# too!
+
+# # +
+# def f(x):
+#   y = sin(x) * 2.
+#   z = - y + x
+#   return {'hi': z, 'there': [x, y]}
+#
+# x, xdot = 3., 1.
+# y, ydot = jvp(f, (x,), (xdot,))
+# print(y)
+# print(ydot)
+
+# -
+
+# ### Vectorized batching with `vmap`
+#
+# First, a couple helper functions, one for producing mapped abstract values
+# from unmapped ones (by removing an axis), and one for moving batch dimensions
+# around:
+
+# +
+def mapped_aval(batch_dim, aval):
+  shape = list(aval.shape)
+  del shape[batch_dim]
+  return ShapedArray(tuple(shape), aval.dtype)
+
+def move_batch_axis(axis_size, src, dst, x):
+  if src is not_mapped:
+    target_shape = list(np.shape(x))
+    target_shape.insert(dst, axis_size)
+    return broadcast(x, target_shape, [dst])
+  elif src == dst:
+    return x
+  else:
+    return moveaxis(x, src, dst)
+
+def moveaxis(x, src: int, dst: int):
+  perm = [i for i in range(np.ndim(x)) if i != src]
+  perm.insert(dst, src)
+  return transpose(x, perm)
+
+
+# -
+
+# The `Tracer` for vectorized batching carries a batched value and an optional
+# integer indicating which axis (if any) is the batch axis.
+
+# +
+from typing import Union
+
+class NotMapped: pass
+not_mapped = NotMapped()
+
+BatchAxis = Union[NotMapped, int]
+
+class BatchTracer(Tracer):
+  def __init__(self, trace, val, batch_dim: BatchAxis):
+    self._trace = trace
+    self.val = val
+    self.batch_dim = batch_dim
+
+  @property
+  def aval(self):
+    if self.batch_dim is not_mapped:
+      return get_aval(self.val)
+    else:
+      return mapped_aval(self.batch_dim, get_aval(self.val))
+
+  def full_lower(self):
+    if self.batch_dim is not_mapped:
+      return full_lower(self.val)
+    else:
+      return self
+
+class BatchTrace(Trace):
+  pure = lift = lambda self, val: BatchTracer(self, val, not_mapped)
+
+  def process_primitive(self, primitive, tracers, params):
+    vals_in, bdims_in = unzip2((t.val, t.batch_dim) for t in tracers)
+    vmap_rule = vmap_rules[primitive]
+    val_outs, bdim_outs = vmap_rule(self.axis_size, vals_in, bdims_in, **params)
+    return [BatchTracer(self, x, bd) for x, bd in zip(val_outs, bdim_outs)]
+
+  @property
+  def axis_size(self):
+    return self.main.global_data
+
+vmap_rules = {}
+# -
+
+# Here we've implemented the optional `Tracer.full_lower` method, which lets us
+# peel off a batching tracer if it's not needed because it doesn't represent a
+# batched value.
+#
+# For `BatchTrace`, analogous to `JVPTrace`, the methods `pure` and `lift` just
+# box a value in a `BatchTracer` with the minimal amount of context, which in
+# this case is a `batch_dim` taking the sentinel value `not_mapped`. Notice we
+# use the `MainTrace`'s interpreter-global data field to store the batch axis
+# size.
+#
+# Next we can define batching interpreter rules for each primitive:
+
+# +
+from functools import partial
+
+def binop_batching_rule(op, axis_size, vals_in, dims_in):
+  (x, y), (x_bdim, y_bdim) = vals_in, dims_in
+  if x_bdim != y_bdim:
+    if x_bdim is not_mapped:
+      x = move_batch_axis(axis_size, x_bdim, y_bdim, x)
+      x_bdim = y_bdim
+    else:
+      y = move_batch_axis(axis_size, y_bdim, x_bdim, y)
+  return [op(x, y)], [x_bdim]
+vmap_rules[add_p] = partial(binop_batching_rule, add)
+vmap_rules[mul_p] = partial(binop_batching_rule, mul)
+
+def vectorized_unop_batching_rule(op, axis_size, vals_in, dims_in):
+  (x,), (x_bdim,) = vals_in, dims_in
+  return [op(x)], [x_bdim]
+vmap_rules[sin_p] = partial(vectorized_unop_batching_rule, sin)
+vmap_rules[cos_p] = partial(vectorized_unop_batching_rule, cos)
+vmap_rules[neg_p] = partial(vectorized_unop_batching_rule, neg)
+
+def reduce_sum_batching_rule(axis_size, vals_in, dims_in, *, axis):
+  (x,), (x_bdim,) = vals_in, dims_in
+  new_axis = axis + (x_bdim <= axis)
+  out_bdim = x_bdim - (new_axis < x_bdim)
+  return [reduce_sum(x, new_axis)], [out_bdim]
+vmap_rules[reduce_sum_p] = reduce_sum_batching_rule
+
+
+# -
+
+# Finally, we add a transformation API to kick off the trace:
+
+# +
+def vmap_flat(f, in_axes, *args):
+  axis_size, = {x.shape[ax] for x, ax in zip(args, in_axes)
+                if ax is not not_mapped}
+  with new_main(BatchTrace, axis_size) as main:
+    trace = BatchTrace(main)
+    tracers_in = [BatchTracer(trace, x, ax) if ax is not None else x
+                  for x, ax in zip(args, in_axes)]
+    outs = f(*tracers_in)
+    tracers_out = [full_raise(trace, out) for out in outs]
+    vals_out, bdims_out = unzip2((t.val, t.batch_dim) for t in tracers_out)
+  outs_transposed = [move_batch_axis(axis_size, bdim, 0, val_out)
+                     for val_out, bdim in zip(vals_out, bdims_out)]
+  return outs_transposed
+
+def vmap(f, in_axes):
+  def batched_f(*args):
+    args_flat, in_tree = tree_flatten(args)
+    in_axes_flat, in_tree2 = tree_flatten(in_axes)
+    if in_tree != in_tree2: raise TypeError
+    f_flat, out_tree = flatten_fun(f, in_tree)
+    outs_flat = vmap_flat(f_flat, in_axes_flat, *args_flat)
+    return tree_unflatten(out_tree(), outs_flat)
+  return batched_f
+
+
+# +
+def add_one_to_a_scalar(scalar):
+  assert np.ndim(scalar) == 0
+  return 1 + scalar
+
+vector_in = np.arange(3.)
+vector_out = vmap(add_one_to_a_scalar, (0,))(vector_in)
+
+print(vector_in)
+print(vector_out)
+
+
+# +
+def jacfwd(f, x):
+  pushfwd = lambda v: jvp(f, (x,), (v,))[1]
+  vecs_in = np.eye(np.size(x)).reshape(np.shape(x) * 2)
+  return vmap(pushfwd, (0,))(vecs_in)
+
+def f(x):
+  return sin(x)
+
+jacfwd(f, np.arange(3.))
+# -
+
+# That's it for `jvp` and `vmap`!
