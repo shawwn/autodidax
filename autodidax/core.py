@@ -14,6 +14,9 @@ from __future__ import annotations
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import NamedTuple
+import functools
+from functools import partial
+
 import sys as _sys
 core = _sys.modules[__name__]
 
@@ -28,6 +31,7 @@ div_p = Primitive('div')
 neg_p = Primitive("neg")
 sin_p = Primitive("sin")
 cos_p = Primitive("cos")
+tanh_p = Primitive("tanh")
 reduce_sum_p = Primitive("reduce_sum")
 reduce_mean_p = Primitive("reduce_mean")
 greater_p = Primitive("greater")
@@ -45,6 +49,7 @@ def div(x, y): return bind1(div_p, x, y)
 def neg(x): return bind1(neg_p, x)
 def sin(x): return bind1(sin_p, x)
 def cos(x): return bind1(cos_p, x)
+def tanh(x): return bind1(tanh_p, x)
 def reduce_sum(x, axis=None): return bind1(reduce_sum_p, x, axis=axis)
 def reduce_mean(x, axis=None): return bind1(reduce_mean_p, x, axis=axis)
 def argmax(x, axis=None): return bind1(argmax_p, x, axis=axis)
@@ -118,6 +123,7 @@ impl_rules[div_p] = lambda x, y: [np.divide(x, y)]
 impl_rules[neg_p] = lambda x: [np.negative(x)]
 impl_rules[sin_p] = lambda x: [np.sin(x)]
 impl_rules[cos_p] = lambda x: [np.cos(x)]
+impl_rules[tanh_p] = lambda x: [np.tanh(x)]
 impl_rules[reduce_sum_p] = lambda x, *, axis: [np.sum(x, axis)]
 impl_rules[reduce_mean_p] = lambda x, *, axis: [np.mean(x, axis)]
 impl_rules[argmin_p] = lambda x, *, axis: [np.argmin(x, axis)]
@@ -355,6 +361,43 @@ class JVPTrace(Trace):
 jvp_rules = {}
 
 
+# TODO
+# def defjvp(primitive, *jvprules):
+#   assert isinstance(primitive, Primitive)
+#   # assert not primitive.multiple_results
+#   jvp_rules[primitive] = partial(standard_jvp, jvprules, primitive)
+#
+#
+# def standard_jvp(jvprules, primitive, primals, tangents, **params):
+#   val_out = primitive.bind(*primals, **params)
+#   tangents_out = [rule(t, *primals, **params) for rule, t in zip(jvprules, tangents)
+#                   if rule is not None and type(t) is not Zero]
+#   return val_out, functools.reduce(add_tangents, tangents_out, Zero.from_value(val_out))
+#
+# def defjvp2(primitive, *jvprules):
+#   assert isinstance(primitive, Primitive)
+#   # assert not primitive.multiple_results
+#   jvp_rules[primitive] = partial(standard_jvp2, jvprules, primitive)
+#
+# def standard_jvp2(jvprules, primitive, primals, tangents, **params):
+#   val_out, = bind(primitive, *primals, **params)
+#   tangents_out = (rule(t, val_out, *primals, **params) for rule, t in zip(jvprules, tangents)
+#                   if rule is not None and type(t) is not Zero)
+#   tangents_out = list(tangents_out)
+#   breakpoint()
+#   return val_out, functools.reduce(add_tangents, tangents_out, Zero.from_value(val_out))
+#
+# def add_tangents(x, y):
+#   if type(x) is Zero:
+#     return y
+#   elif type(y) is Zero:
+#     return x
+#   else:
+#     return add_jaxvals(x, y)
+#
+# add_jaxvals = add
+
+
 # -
 
 # Notice both `pure` and `lift` package a value into a `JVPTracer` with the
@@ -387,6 +430,16 @@ def cos_jvp(primals, tangents):
   (x,), (x_dot,) = primals, tangents
   return [cos(x)], [-sin(x) * x_dot]
 jvp_rules[cos_p] = cos_jvp
+
+def tanh_grad(x_dot, val_out, x):
+  return mul(add(x_dot, mul(x_dot, val_out)),
+             sub(ones_like(x), val_out))
+# defjvp2(tanh_p, tanh_grad)
+def tanh_jvp(primals, tangents):
+  (x,), (x_dot,) = primals, tangents
+  val_out = tanh(x)
+  return [val_out], [tanh_grad(x_dot, val_out, x)]
+jvp_rules[tanh_p] = tanh_jvp
 
 def neg_jvp(primals, tangents):
   (x,), (x_dot,) = primals, tangents
@@ -577,16 +630,30 @@ def _tree_unflatten(treedef: PyTreeDef, xs: Iterator) -> Any:
 # input and output containers. That'll come in handy with future transformations
 # too!
 
+# +
+def f(x):
+  y = sin(x) * 2.
+  z = - y + x
+  return {'hi': z, 'there': [x, y]}
+
+x, xdot = 3., 1.
+y, ydot = jvp(f, (x,), (xdot,))
+print(y)
+print(ydot)
+
 # # +
-# def f(x):
-#   y = sin(x) * 2.
-#   z = - y + x
-#   return {'hi': z, 'there': [x, y]}
+# class Zero:
+#   __slots__ = ['aval']
+#   def __init__(self, aval):
+#     self.aval = aval
+#   def __repr__(self):
+#     return 'Zero({})'.format(self.aval)
+#   @staticmethod
+#   def from_value(val):
+#     return Zero(raise_to_shaped(get_aval(val)))
 #
-# x, xdot = 3., 1.
-# y, ydot = jvp(f, (x,), (xdot,))
-# print(y)
-# print(ydot)
+# register_pytree_node(Zero, lambda z: ((), z.aval), lambda aval, _: Zero(aval))
+
 
 # -
 
@@ -699,6 +766,7 @@ def vectorized_unop_batching_rule(op, axis_size, vals_in, dims_in):
   return [op(x)], [x_bdim]
 vmap_rules[sin_p] = partial(vectorized_unop_batching_rule, sin)
 vmap_rules[cos_p] = partial(vectorized_unop_batching_rule, cos)
+vmap_rules[tanh_p] = partial(vectorized_unop_batching_rule, tanh)
 vmap_rules[neg_p] = partial(vectorized_unop_batching_rule, neg)
 
 def reduce_sum_batching_rule(axis_size, vals_in, dims_in, *, axis):
@@ -1123,6 +1191,7 @@ def vectorized_unop_abstract_eval(x: ShapedArray) -> List[ShapedArray]:
 
 abstract_eval_rules[sin_p] = vectorized_unop_abstract_eval
 abstract_eval_rules[cos_p] = vectorized_unop_abstract_eval
+abstract_eval_rules[tanh_p] = vectorized_unop_abstract_eval
 abstract_eval_rules[neg_p] = vectorized_unop_abstract_eval
 
 def reduction_abstract_eval(x: ShapedArray, *, axis: int) -> List[ShapedArray]:
@@ -1545,6 +1614,7 @@ def direct_translation(op, c, in_avals, in_vals):
 # xla_translations[neg_p] = partial(direct_translation, xops.Neg)
 # xla_translations[sin_p] = partial(direct_translation, xops.Sin)
 # xla_translations[cos_p] = partial(direct_translation, xops.Cos)
+# xla_translations[tanh_p] = partial(direct_translation, xops.Tanh)
 # xla_translations[greater_p] = partial(direct_translation, xops.Gt)
 # xla_translations[less_p] = partial(direct_translation, xops.Lt)
 
@@ -2476,7 +2546,7 @@ def reduced_transpose_rule(cts, operand, *, axis):
   cotangent, = cts
   # assert ad.is_undefined_primal(operand)
   input_shape = operand.aval.shape
-  broadcast_dimensions = tuple(np.delete(np.arange(len(input_shape)), axis))
+  broadcast_dimensions = () if axis is None else tuple(np.delete(np.arange(len(input_shape)), axis))
   result = broadcast_in_dim(cotangent, input_shape, broadcast_dimensions)
   assert result.shape == input_shape
   return [result]
