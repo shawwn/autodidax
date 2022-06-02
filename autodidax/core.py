@@ -39,6 +39,7 @@ argmin_p = Primitive("argmin")
 argmax_p = Primitive("argmax")
 
 def add(x, y): return bind1(add_p, x, y)
+def sub(x, y): return add(x, neg(y))
 def mul(x, y): return bind1(mul_p, x, y)
 def div(x, y): return bind1(div_p, x, y)
 def neg(x): return bind1(neg_p, x)
@@ -53,6 +54,8 @@ def less(x, y): return bind1(less_p, x, y)
 def transpose(x, perm): return bind1(transpose_p, x, perm=perm)
 def broadcast(x, shape, axes): return bind1(broadcast_p, x, shape=shape, axes=axes)
 def broadcast_in_dim(x, shape, broadcast_dimensions): return bind1(broadcast_in_dim_p, x, shape=shape, broadcast_dimensions=broadcast_dimensions)
+def zeros_like(x): return mul(x, 0)
+def ones_like(x): return zeros_like(x) + 1
 
 def bind1(prim, *args, **params):
   out, = bind(prim, *args, **params)
