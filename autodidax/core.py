@@ -13,8 +13,9 @@ from __future__ import annotations
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from typing import NamedTuple
+import sys as _sys
+core = _sys.modules[__name__]
 
 print = lambda *args: None
 
@@ -31,6 +32,9 @@ greater_p = Primitive("greater")
 less_p = Primitive("less")
 transpose_p = Primitive("transpose")
 broadcast_p = Primitive("broadcast")
+broadcast_in_dim_p = Primitive("broadcast_in_dim")
+argmin_p = Primitive("argmin")
+argmax_p = Primitive("argmax")
 
 def add(x, y): return bind1(add_p, x, y)
 def mul(x, y): return bind1(mul_p, x, y)
@@ -38,10 +42,13 @@ def neg(x): return bind1(neg_p, x)
 def sin(x): return bind1(sin_p, x)
 def cos(x): return bind1(cos_p, x)
 def reduce_sum(x, axis=None): return bind1(reduce_sum_p, x, axis=axis)
+def argmax(x, axis=None): return bind1(argmax_p, x, axis=axis)
+def argmin(x, axis=None): return bind1(argmin_p, x, axis=axis)
 def greater(x, y): return bind1(greater_p, x, y)
 def less(x, y): return bind1(less_p, x, y)
 def transpose(x, perm): return bind1(transpose_p, x, perm=perm)
 def broadcast(x, shape, axes): return bind1(broadcast_p, x, shape=shape, axes=axes)
+def broadcast_in_dim(x, shape, broadcast_dimensions): return bind1(broadcast_in_dim_p, x, shape=shape, broadcast_dimensions=broadcast_dimensions)
 
 def bind1(prim, *args, **params):
   out, = bind(prim, *args, **params)
@@ -50,7 +57,7 @@ def bind1(prim, *args, **params):
 # ---------------
 
 from contextlib import contextmanager
-from typing import Type, List, Tuple, Sequence, Optional, Any
+from typing import Type, List, Tuple, Sequence, Optional, Any, Union
 
 class MainTrace(NamedTuple):
   level: int
@@ -104,6 +111,8 @@ impl_rules[neg_p] = lambda x: [np.negative(x)]
 impl_rules[sin_p] = lambda x: [np.sin(x)]
 impl_rules[cos_p] = lambda x: [np.cos(x)]
 impl_rules[reduce_sum_p] = lambda x, *, axis: [np.sum(x, axis)]
+impl_rules[argmin_p] = lambda x, *, axis: [np.argmin(x, axis)]
+impl_rules[argmax_p] = lambda x, *, axis: [np.argmax(x, axis)]
 impl_rules[greater_p] = lambda x, y: [np.greater(x, y)]
 impl_rules[less_p] = lambda x, y: [np.less(x, y)]
 impl_rules[transpose_p] = lambda x, *, perm: [np.transpose(x, perm)]
@@ -113,6 +122,15 @@ def broadcast_impl(x, *, shape, axes):
     x = np.expand_dims(x, axis)
   return [np.broadcast_to(x, shape)]
 impl_rules[broadcast_p] = broadcast_impl
+
+
+def broadcast_in_dim_impl(operand, *, shape, broadcast_dimensions):
+  in_reshape = np.ones(len(shape), dtype=np.int32)
+  for i, bd in enumerate(broadcast_dimensions):
+    in_reshape[bd] = operand.shape[i]
+  return [np.broadcast_to(np.reshape(operand, in_reshape), shape)]
+impl_rules[broadcast_in_dim_p] = broadcast_in_dim_impl
+
 
 # ---------------
 
@@ -365,6 +383,8 @@ def reduce_sum_jvp(primals, tangents, *, axis):
   (x,), (x_dot,) = primals, tangents
   return [reduce_sum(x, axis)], [reduce_sum(x_dot, axis)]
 jvp_rules[reduce_sum_p] = reduce_sum_jvp
+jvp_rules[argmax_p] = reduce_sum_jvp
+jvp_rules[argmin_p] = reduce_sum_jvp
 
 def greater_jvp(primals, tangents):
   (x, y), _ = primals, tangents
@@ -659,6 +679,8 @@ def reduce_sum_batching_rule(axis_size, vals_in, dims_in, *, axis):
   out_bdim = x_bdim - (new_axis < x_bdim)
   return [reduce_sum(x, new_axis)], [out_bdim]
 vmap_rules[reduce_sum_p] = reduce_sum_batching_rule
+vmap_rules[argmin_p] = reduce_sum_batching_rule
+vmap_rules[argmax_p] = reduce_sum_batching_rule
 
 
 # -
@@ -1033,8 +1055,9 @@ def _inline_literals(jaxpr: Jaxpr, consts: List[Any]) -> Tuple[Jaxpr, List[Any]]
 def binop_abstract_eval(x: ShapedArray, y: ShapedArray) -> List[ShapedArray]:
   if not isinstance(x, ShapedArray) or not isinstance(y, ShapedArray):
     raise TypeError
-  if raise_to_shaped(x) != raise_to_shaped(y): raise TypeError
-  return [ShapedArray(x.shape, x.dtype)]
+  if raise_to_shaped(x).shape != raise_to_shaped(y).shape: raise TypeError
+  dtype = np.find_common_type([], [x.dtype, y.dtype])
+  return [ShapedArray(x.shape, dtype)]
 
 abstract_eval_rules[add_p] = binop_abstract_eval
 abstract_eval_rules[mul_p] = binop_abstract_eval
@@ -1058,6 +1081,8 @@ def reduce_sum_abstract_eval(x: ShapedArray, *, axis: int) -> List[ShapedArray]:
   new_shape = [d for i, d in enumerate(x.shape) if i != axis]
   return [ShapedArray(tuple(new_shape), x.dtype)]
 abstract_eval_rules[reduce_sum_p] = reduce_sum_abstract_eval
+abstract_eval_rules[argmin_p] = reduce_sum_abstract_eval
+abstract_eval_rules[argmax_p] = reduce_sum_abstract_eval
 
 def broadcast_abstract_eval(x: ShapedArray, *, shape: Sequence[int],
                             axes: Sequence[int]) -> List[ShapedArray]:
@@ -1437,12 +1462,12 @@ class DeviceBuffer(np.ndarray):
 
 jax_types.add(DeviceBuffer)
 
-def buffer_from_pyval(val):
+def asarray(val):
   # return xb.get_backend(None).buffer_from_pyval(val)
   # return np.asarray(val)
   return DeviceBuffer(val)
 
-default_input_handler = buffer_from_pyval
+default_input_handler = asarray
 input_handlers = {ty: default_input_handler for ty in
                   [bool, int, float, np.ndarray, np.float64, np.float32, DeviceBuffer]}
 
@@ -2391,6 +2416,17 @@ def add_transpose_rule(cts, x, y):
   return [z_bar, z_bar]
 transpose_rules[add_p] = add_transpose_rule
 
+def reduce_sum_transpose_rule(cts, operand, *, axis):
+  cotangent, = cts
+  # assert ad.is_undefined_primal(operand)
+  input_shape = operand.aval.shape
+  broadcast_dimensions = tuple(np.delete(np.arange(len(input_shape)), axis))
+  result = broadcast_in_dim(cotangent, input_shape, broadcast_dimensions)
+  assert result.shape == input_shape
+  return [result]
+transpose_rules[reduce_sum_p] = reduce_sum_transpose_rule
+
+
 def xla_call_transpose_rule(cts, *invals, jaxpr, num_consts):
   del num_consts  # Unused
   undef_primals = [type(x) is UndefPrimal for x in invals]
@@ -2822,3 +2858,324 @@ pp_rules[cond_p] = pprint_cond
 
 
 del print
+
+
+
+### Operations on shapes and dimension sizes.
+
+# Shapes are tuples of dimension sizes, which are normally integers. We allow
+# modules to extend the set of dimension sizes to contain other types, e.g.,
+# symbolic dimensions in jax2tf.shape_poly.DimVar and masking.Poly.
+DimSize = Union[int, Any]  # extensible
+Shape = Sequence[DimSize]
+
+class InconclusiveDimensionOperation(Exception):
+  """Raised when we cannot conclusively compute with symbolic dimensions."""
+  pass
+
+class DimensionHandler:
+  """Operations on dimension sizes.
+
+  Dimension sizes are normally integer constants, but can also be symbolic,
+  e.g., masking.Poly or jax2tf.shape_poly.DimVar.
+
+  The base class works for integers only. Subclasses are invoked when at least
+  one of the operands has a type registered in _SPECIAL_DIMENSION_HANDLERS. In
+  that case, all operands are guaranteed to be either the special dimension
+  type, or Python integer scalars.
+
+  Subclasses should raise InconclusiveDimensionOperation if the result cannot
+  be computed in some contexts.
+  """
+  def is_constant(self, d: DimSize) -> bool:
+    """The dimension is a constant."""
+    return True
+
+  def symbolic_equal(self, d1: DimSize, d2: DimSize) -> bool:
+    """True iff the dimension sizes are equal in all contexts; False otherwise.
+    Unlike `d1 == d2` this never raises InconclusiveDimensionOperation.
+    """
+    return d1 == d2
+
+  def greater_equal(self, d1: DimSize, d2: DimSize) -> bool:
+    """Computes `d1 >= d2`.
+    Raise InconclusiveDimensionOperation if the result is different in
+    different contexts.
+    """
+    return d1 >= d2
+
+  def sum(self, *ds: DimSize) -> DimSize:
+    """Sum of dimensions.
+    Raises InconclusiveDimensionOperation if the result cannot be represented
+    by the same DimSize in all contexts.
+    """
+    return sum(ds)
+
+  def diff(self, d1: DimSize, d2: DimSize) -> DimSize:
+    """Difference of dimensions.
+    Raises InconclusiveDimensionOperation if the result cannot be represented
+    by the same DimSize in all contexts.
+    """
+    return d1 - d2
+
+  def divide_shape_sizes(self, s1: Shape, s2: Shape) -> DimSize:
+    """Computes integer "i" such that i  * size(s2) == size(s1).
+
+    Raise InconclusiveDimensionOperation if there is no such integer for all
+    contexts,
+    """
+    sz1 = int(np.prod(s1))
+    sz2 = int(np.prod(s2))
+    if sz1 == 0 and sz2 == 0:
+      return 1
+    if sz1 % sz2:
+      raise InconclusiveDimensionOperation(f"Cannot divide evenly the sizes of shapes {tuple(s1)} and {tuple(s2)}")
+    return sz1 // sz2
+
+  def stride(self, d: DimSize, window_size: DimSize, window_stride: DimSize) -> DimSize:
+    """(d - window_size) // window_stride + 1"""
+    return (d - window_size) // window_stride + 1
+
+  def dilate(self, d: DimSize, dilation: int) -> DimSize:
+    """Implements `0 if d == 0 else 1 + dilation * (d - 1))`"""
+    return 0 if d == 0 else 1 + dilation * (d - 1)
+
+  def as_value(self, d: DimSize):
+    """Turns a dimension size into a JAX value that we can compute with."""
+    return d
+
+_dimension_handler_int = DimensionHandler()
+_SPECIAL_DIMENSION_HANDLERS: Dict[type, DimensionHandler] = {}
+
+def _dim_handler_and_canonical(*dlist: DimSize) -> Tuple[DimensionHandler, Tuple[DimSize, ...]]:
+  """Finds the handler for the given dimensions; also returns the canonical dimensions.
+
+  A dimension is canonical if it is a Python integer scalar, or has a type
+  registered in _SPECIAL_DIMENSION_HANDLERS.
+  """
+  special_handlers = set()
+  canonical = []
+  for d in dlist:
+    handler = _SPECIAL_DIMENSION_HANDLERS.get(type(d))
+    if handler:
+      special_handlers.add(handler)
+      canonical.append(d)
+    else:
+      try:
+        canonical.append(operator.index(d))
+      except TypeError:
+        raise _invalid_shape_error(dlist)
+
+  if len(special_handlers) > 1:
+    msg = (f"Dimension size operation involves multiple special dimension types {dlist}")
+    raise ValueError(msg)
+  return next(iter(special_handlers), _dimension_handler_int), tuple(canonical)
+
+def is_special_dim_size(v: Any) -> bool:
+  """Checks if a value is a special DimSize."""
+  handler = _SPECIAL_DIMENSION_HANDLERS.get(type(v))
+  return (handler is not None)
+
+def is_constant_dim(d: DimSize) -> bool:
+  handler, ds = _dim_handler_and_canonical(d)
+  return handler.is_constant(*ds)
+
+def symbolic_equal_dim(d1: DimSize, d2: DimSize) -> bool:
+  if d1 is d2: return True  # identical objects always compare equal
+  handler, ds = _dim_handler_and_canonical(d1, d2)
+  return handler.symbolic_equal(*ds)
+
+def symbolic_equal_one_of_dim(d1: DimSize, dlist: Sequence[DimSize]) -> bool:
+  if any(d1 is d for d in dlist): return True  # identical always implies equal
+  handler, ds = _dim_handler_and_canonical(d1, *dlist)
+  return any([handler.symbolic_equal(ds[0], d) for d in ds[1:]])
+
+def symbolic_equal_shape(s1: Shape, s2: Shape) -> bool:
+  return (len(s1) == len(s2) and
+          all(unsafe_map(symbolic_equal_dim, s1, s2)))
+
+def greater_equal_dim(d1: DimSize, d2: DimSize) -> bool:
+  # TODO(mattjj): revise this temporary workaround for dynamic shapes
+  if isinstance(d1, Tracer) or isinstance(d2, Tracer):
+    return True
+
+  handler, ds = _dim_handler_and_canonical(d1, d2)
+  return handler.greater_equal(*ds)
+
+def greater_equal_shape(s1: Shape, s2: Shape) -> bool:
+  return all(map(greater_equal_dim, s1, s2))
+
+def sum_dim(*ds: DimSize) -> DimSize:
+  handler, ds = _dim_handler_and_canonical(*ds)
+  return handler.sum(*ds)
+
+def sum_shapes(*ss: Shape) -> Shape:
+  return tuple(map(sum_dim, *ss))
+
+def diff_dim(d1: DimSize, d2: DimSize) -> DimSize:
+  handler, ds = _dim_handler_and_canonical(d1, d2)
+  return handler.diff(*ds)
+
+def diff_shape(s1: Shape, s2: Shape) -> Shape:
+  return tuple(map(diff_dim, s1, s2))
+
+def divide_shape_sizes(s1: Shape, s2: Shape) -> DimSize:
+  """Returns an integer "i" s.t., i * size(s2) == size(s1).
+  Raises if there is no such integer."""
+  s1 = s1 or (1,)
+  s2 = s2 or (1,)
+  handler, ds = _dim_handler_and_canonical(*s1, *s2)
+  return handler.divide_shape_sizes(ds[:len(s1)], ds[len(s1):])
+
+def same_shape_sizes(s1: Shape, s2: Shape) -> bool:
+  return 1 == divide_shape_sizes(s1, s2)
+
+def is_empty_shape(s: Shape) -> bool:
+  return any(symbolic_equal_dim(d, 0) for d in s)
+
+def dilate_dim(d: DimSize, dilation: DimSize) -> DimSize:
+  """Implements `0 if d == 0 else 1 + dilation * (d - 1))`"""
+  handler, ds = _dim_handler_and_canonical(d, dilation)
+  return handler.dilate(*ds)
+
+def dilate_shape(s: Shape, dilations: Sequence[int]) -> Shape:
+  return tuple(map(dilate_dim, s, dilations))
+
+def stride_dim(d: DimSize, window_size: DimSize, window_stride: DimSize) -> DimSize:
+  handler, ds = _dim_handler_and_canonical(d, window_size, window_stride)
+  return handler.stride(*ds)
+
+def stride_shape(s: Shape, window_size: Shape, window_stride: Shape) -> Shape:
+  """(s - window_size) // window_stride + 1"""
+  return tuple(map(stride_dim, s, window_size, window_stride))
+
+def dimension_as_value(d: DimSize):
+  """Turns a dimension size into a JAX value that we can compute with.
+     This is the identity function for constant dimensions."""
+  if isinstance(d, Tracer): return d
+  handler, ds = _dim_handler_and_canonical(d)
+  return handler.as_value(*ds)
+
+def _canonicalize_dimension(dim: DimSize) -> DimSize:
+  if (type(dim) in _SPECIAL_DIMENSION_HANDLERS or
+      isinstance(dim, Tracer) and config.jax_dynamic_shapes):
+    return dim
+  else:
+    return operator.index(dim)
+
+def canonicalize_shape(shape: Shape, context: str="") -> Shape:
+  """Canonicalizes and checks for errors in a user-provided shape value.
+
+  Args:
+    shape: a Python value that represents a shape.
+
+  Returns:
+    A tuple of canonical dimension values.
+  """
+  try:
+    return tuple(unsafe_map(_canonicalize_dimension, shape))
+  except TypeError:
+    pass
+  raise _invalid_shape_error(shape, context)
+
+def canonicalize_dim(d: DimSize, context: str="") -> DimSize:
+  """Canonicalizes and checks for errors in a user-provided shape dimension value.
+
+  Args:
+    f: a Python value that represents a dimension.
+
+  Returns:
+    A canonical dimension value.
+  """
+  return canonicalize_shape((d,), context)[0]
+
+def _invalid_shape_error(shape: Shape, context: str=""):
+  msg = ("Shapes must be 1D sequences of concrete values of integer type, "
+         f"got {shape}.")
+  if context:
+    msg += f" {context}."
+  if any(isinstance(x, Tracer) and isinstance(get_aval(x), ShapedArray)
+         and not isinstance(get_aval(x), ConcreteArray) for x in shape):
+    msg += ("\nIf using `jit`, try using `static_argnums` or applying `jit` to "
+            "smaller subfunctions.")
+  return TypeError(msg)
+
+def _check_shapelike(fun_name, arg_name, obj, non_zero_shape=False):
+  """Check that `obj` is a shape-like value (e.g. tuple of nonnegative ints)."""
+  if not isinstance(obj, (tuple, list, np.ndarray)):
+    msg = "{} {} must be of type tuple/list/ndarray, got {}."
+    raise TypeError(msg.format(fun_name, arg_name, type(obj)))
+  # bool(obj) for an ndarray raises an error, so we check len
+  if not len(obj):  # pylint: disable=g-explicit-length-test
+    return
+  if (config.jax_dynamic_shapes and isinstance(obj, (tuple, list)) and
+      any(isinstance(d, core.Tracer) for d in obj)):
+    return  # TODO(mattjj): handle more checks in the dynamic shape case
+  obj_arr = np.array(obj)
+  if obj_arr.ndim != 1:
+    msg = "{} {} must be rank 1, got {}."
+    raise TypeError(msg.format(obj_arr.ndim))
+  try:
+    canonicalize_shape(obj_arr)
+  except TypeError as err:
+    msg = "{} {} must have every element be an integer type, got {}."
+    raise TypeError(msg.format(fun_name, arg_name, tuple(map(type, obj)))) from err
+  lower_bound, bound_error = (
+      (1, "strictly positive") if non_zero_shape else (0, "nonnegative"))
+  if not all(core.greater_equal_dim(d, lower_bound) for d in obj_arr):
+    msg = "{} {} must have every element be {}, got {}."
+    raise TypeError(msg.format(fun_name, arg_name, bound_error, obj))
+
+
+def _broadcast_in_dim_shape_rule(operand, *, shape, broadcast_dimensions):
+  _check_shapelike('broadcast_in_dim', 'shape', shape)
+  _check_shapelike('broadcast_in_dim', 'broadcast_dimensions',
+                   broadcast_dimensions)
+  operand_ndim = np.ndim(operand)
+  if operand_ndim != len(broadcast_dimensions):
+    msg = ('broadcast_in_dim broadcast_dimensions must have length equal to '
+           'operand ndim; got broadcast_dimensions {} for operand ndim {}.')
+    raise TypeError(msg.format(broadcast_dimensions, operand_ndim))
+  if len(shape) < operand_ndim:
+    msg = ('broadcast_in_dim target broadcast shape must have equal or higher rank '
+           'to the operand shape; got operand ndim {} and target broadcast ndim {}.')
+    raise TypeError(msg.format(operand_ndim, len(shape)))
+  if not set(broadcast_dimensions).issubset(set(range(len(shape)))):
+    msg = ('broadcast_in_dim broadcast_dimensions must be a subset of output '
+           'dimensions, got {} for operand ndim {} and shape {}.')
+    raise TypeError(msg.format(broadcast_dimensions, operand_ndim, shape))
+  if not all(core.symbolic_equal_one_of_dim(operand.shape[i],
+                                            [1, shape[broadcast_dimensions[i]]])
+             for i in range(operand_ndim)):
+    msg = (
+        "broadcast_in_dim operand dimension sizes must either be 1, or be "
+        "equal to their corresponding dimensions in the target broadcast "
+        "shape; got operand of shape {}, target broadcast shape {}, "
+        "broadcast_dimensions {} ")
+    raise TypeError(msg.format(operand.shape, shape, broadcast_dimensions))
+  if (len(broadcast_dimensions) != len(set(broadcast_dimensions)) or
+      tuple(broadcast_dimensions) != tuple(sorted(broadcast_dimensions))):
+    msg = ("broadcast_in_dim broadcast_dimensions must be strictly increasing; "
+           "got broadcast_dimensions {}")
+    raise TypeError(msg.format(broadcast_dimensions))
+
+  return shape
+abstract_eval_rules[broadcast_in_dim_p] = _broadcast_in_dim_shape_rule
+
+def _broadcast_in_dim_transpose_rule(ct, operand, *, shape, broadcast_dimensions):
+  shape_in = operand.aval.shape
+  unit_dimensions = tuple(i for i, s in enumerate(shape_in) if core.symbolic_equal_dim(s,  1))
+  bdims = tuple(np.delete(broadcast_dimensions, unit_dimensions))
+  axes = tuple(np.delete(range(len(shape)), bdims))
+  return [expand_dims(_reduce_sum(ct, axes), unit_dimensions)]
+transpose_rules[broadcast_in_dim_p] = _broadcast_in_dim_transpose_rule
+
+def _broadcast_in_dim_batch_rule(batched_args, batch_dims, *, shape,
+                                 broadcast_dimensions):
+  operand, = batched_args
+  bdim, = batch_dims
+  new_operand = batching.moveaxis(operand, bdim, 0)
+  new_shape = (operand.shape[bdim],) + shape
+  new_broadcast_dimensions = (0,) + tuple(np.add(1, broadcast_dimensions))
+  return broadcast_in_dim(new_operand, new_shape, new_broadcast_dimensions), 0
+vmap_rules[broadcast_in_dim_p] = _broadcast_in_dim_batch_rule
