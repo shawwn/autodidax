@@ -15,6 +15,7 @@ from __future__ import annotations
 # limitations under the License.
 from typing import NamedTuple
 import functools
+import operator
 from functools import partial
 
 import sys as _sys
@@ -32,8 +33,12 @@ neg_p = Primitive("neg")
 sin_p = Primitive("sin")
 cos_p = Primitive("cos")
 tanh_p = Primitive("tanh")
+exp_p = Primitive("exp")
+log_p = Primitive("log")
 reduce_sum_p = Primitive("reduce_sum")
 reduce_mean_p = Primitive("reduce_mean")
+reduce_min_p = Primitive("reduce_min")
+reduce_max_p = Primitive("reduce_max")
 greater_p = Primitive("greater")
 less_p = Primitive("less")
 transpose_p = Primitive("transpose")
@@ -47,20 +52,40 @@ def sub(x, y): return add(x, neg(y))
 def mul(x, y): return bind1(mul_p, x, y)
 def div(x, y): return bind1(div_p, x, y)
 def neg(x): return bind1(neg_p, x)
+def exp(x): return bind1(exp_p, x)
+def log(x): return bind1(log_p, x)
 def sin(x): return bind1(sin_p, x)
 def cos(x): return bind1(cos_p, x)
 def tanh(x): return bind1(tanh_p, x)
-def reduce_sum(x, axis=None): return bind1(reduce_sum_p, x, axis=axis)
-def reduce_mean(x, axis=None): return bind1(reduce_mean_p, x, axis=axis)
-def argmax(x, axis=None): return bind1(argmax_p, x, axis=axis)
-def argmin(x, axis=None): return bind1(argmin_p, x, axis=axis)
+def exp(x): return bind1(exp_p, x)
+def log(x): return bind1(log_p, x)
+def reduce_sum(x, axis=None, keepdims=False): return bind1(reduce_sum_p, x, axis=axis, keepdims=keepdims)
+def reduce_mean(x, axis=None, keepdims=False): return bind1(reduce_mean_p, x, axis=axis, keepdims=keepdims)
+def reduce_min(x, axis=None, keepdims=False): return bind1(reduce_min_p, x, axis=axis, keepdims=keepdims)
+def reduce_max(x, axis=None, keepdims=False): return bind1(reduce_max_p, x, axis=axis, keepdims=keepdims)
+def argmax(x, axis=None, keepdims=False): return bind1(argmax_p, x, axis=axis, keepdims=keepdims)
+def argmin(x, axis=None, keepdims=False): return bind1(argmin_p, x, axis=axis, keepdims=keepdims)
 def greater(x, y): return bind1(greater_p, x, y)
 def less(x, y): return bind1(less_p, x, y)
 def transpose(x, perm): return bind1(transpose_p, x, perm=perm)
-def broadcast(x, shape, axes): return bind1(broadcast_p, x, shape=shape, axes=axes)
+def broadcast(x, shape, axes=None): return bind1(broadcast_p, x, shape=shape, axes=axes)
 def broadcast_in_dim(x, shape, broadcast_dimensions): return bind1(broadcast_in_dim_p, x, shape=shape, broadcast_dimensions=broadcast_dimensions)
-def zeros_like(x): return mul(x, 0)
-def ones_like(x): return zeros_like(x) + 1
+def full(shape, fill_value): return broadcast(fill_value, shape)
+def zeros(shape): return full(shape, 0.0)
+def ones(shape): return full(shape, 1.0)
+def zeros_like(x): return zeros(np.shape(x))
+def ones_like(x): return ones(np.shape(x))
+
+def expand_dims(array: Array, dimensions: Sequence[int]) -> Array:
+  """Insert any number of size 1 dimensions into an array."""
+  dimensions = _ensure_index_tuple(dimensions)
+  ndim_out = np.ndim(array) + len(dimensions)
+  dims_set = frozenset(canonicalize_axis(i, ndim_out) for i in dimensions)
+  result_shape = list(np.shape(array))
+  for i in sorted(dims_set):
+    result_shape.insert(i, 1)
+  broadcast_dims = [i for i in range(ndim_out) if i not in dims_set]
+  return broadcast_in_dim(array, result_shape, broadcast_dims)
 
 def bind1(prim, *args, **params):
   out, = bind(prim, *args, **params)
@@ -124,22 +149,31 @@ impl_rules[neg_p] = lambda x: [np.negative(x)]
 impl_rules[sin_p] = lambda x: [np.sin(x)]
 impl_rules[cos_p] = lambda x: [np.cos(x)]
 impl_rules[tanh_p] = lambda x: [np.tanh(x)]
-impl_rules[reduce_sum_p] = lambda x, *, axis: [np.sum(x, axis)]
-impl_rules[reduce_mean_p] = lambda x, *, axis: [np.mean(x, axis)]
-impl_rules[argmin_p] = lambda x, *, axis: [np.argmin(x, axis)]
-impl_rules[argmax_p] = lambda x, *, axis: [np.argmax(x, axis)]
+impl_rules[exp_p] = lambda x: [np.exp(x)]
+impl_rules[log_p] = lambda x: [np.log(x)]
+impl_rules[reduce_sum_p] = lambda x, *, axis, keepdims: [np.sum(x, axis, keepdims=keepdims)]
+impl_rules[reduce_mean_p] = lambda x, *, axis, keepdims: [np.mean(x, axis, keepdims=keepdims)]
+impl_rules[reduce_min_p] = lambda x, *, axis, keepdims: [np.min(x, axis, keepdims=keepdims)]
+impl_rules[reduce_max_p] = lambda x, *, axis, keepdims: [np.max(x, axis, keepdims=keepdims)]
+def argminmax(func, x, axis, keepdims):
+  out = func(x, axis)
+  if keepdims:
+    out = expand_dims(out, axis)
+  return out
+impl_rules[argmin_p] = lambda x, *, axis, keepdims: [argminmax(np.argmin, x, axis, keepdims=keepdims)]
+impl_rules[argmax_p] = lambda x, *, axis, keepdims: [argminmax(np.argmax, x, axis, keepdims=keepdims)]
 impl_rules[greater_p] = lambda x, y: [np.greater(x, y)]
 impl_rules[less_p] = lambda x, y: [np.less(x, y)]
 impl_rules[transpose_p] = lambda x, *, perm: [np.transpose(x, perm)]
 
-def broadcast_impl(x, *, shape, axes):
-  for axis in sorted(axes):
+def broadcast_impl(x, shape, axes):
+  for axis in sorted(axes or ()):
     x = np.expand_dims(x, axis)
   return [np.broadcast_to(x, shape)]
 impl_rules[broadcast_p] = broadcast_impl
 
 
-def broadcast_in_dim_impl(operand, *, shape, broadcast_dimensions):
+def broadcast_in_dim_impl(operand, shape, broadcast_dimensions):
   in_reshape = np.ones(len(shape), dtype=np.int32)
   for i, bd in enumerate(broadcast_dimensions):
     in_reshape[bd] = operand.shape[i]
@@ -320,17 +354,32 @@ def unzip2(pairs):
     lst2.append(x2)
   return lst1, lst2
 
-map_ = map
+unsafe_map = map
 def map(f, *xs):
-  return list(map_(f, *xs))
+  return list(unsafe_map(f, *xs))
 
-zip_ = zip
+unsafe_zip = zip
 def zip(*args):
   fst, *rest = args = map(list, args)
   n = len(fst)
   for arg in rest:
     assert len(arg) == n
-  return list(zip_(*args))
+  return list(unsafe_zip(*args))
+
+
+def _ensure_index(x: Any) -> Union[int, Tuple[int, ...]]:
+  """Ensure x is either an index or a tuple of indices."""
+  try:
+    return operator.index(x)
+  except TypeError:
+    return tuple(map(operator.index, x))
+
+def _ensure_index_tuple(x: Any) -> Tuple[int, ...]:
+  """Convert x to a tuple of indices."""
+  try:
+    return (operator.index(x),)
+  except TypeError:
+    return tuple(map(operator.index, x))
 
 
 # -
@@ -441,29 +490,50 @@ def tanh_jvp(primals, tangents):
   return [val_out], [tanh_grad(x_dot, val_out, x)]
 jvp_rules[tanh_p] = tanh_jvp
 
+def exp_jvp(primals, tangents):
+  (x,), (x_dot,) = primals, tangents
+  val_out = exp(x)
+  return [val_out], [mul(x_dot, val_out)]
+jvp_rules[exp_p] = exp_jvp
+
+def log_jvp(primals, tangents):
+  (x,), (x_dot,) = primals, tangents
+  return [val_out], [div(x_dot, x)]
+jvp_rules[log_p] = log_jvp
+
 def neg_jvp(primals, tangents):
   (x,), (x_dot,) = primals, tangents
   return [neg(x)], [neg(x_dot)]
 jvp_rules[neg_p] = neg_jvp
 
-def reduce_sum_jvp(primals, tangents, *, axis):
+def reduce_sum_jvp(primals, tangents, *, axis, keepdims):
   (x,), (x_dot,) = primals, tangents
-  return [reduce_sum(x, axis)], [reduce_sum(x_dot, axis)]
+  return [reduce_sum(x, axis, keepdims)], [reduce_sum(x_dot, axis, keepdims)]
 jvp_rules[reduce_sum_p] = reduce_sum_jvp
 
-def reduce_mean_jvp(primals, tangents, *, axis):
+def reduce_mean_jvp(primals, tangents, *, axis, keepdims):
   (x,), (x_dot,) = primals, tangents
-  return [reduce_mean(x, axis)], [reduce_mean(x_dot, axis)]
+  return [reduce_mean(x, axis, keepdims)], [reduce_mean(x_dot, axis, keepdims)]
 jvp_rules[reduce_mean_p] = reduce_mean_jvp
 
-def argmax_jvp(primals, tangents, *, axis):
+def reduce_min_jvp(primals, tangents, *, axis, keepdims):
   (x,), (x_dot,) = primals, tangents
-  return [argmax(x, axis)], [argmax(x_dot, axis)]
+  return [reduce_min(x, axis, keepdims)], [reduce_min(x_dot, axis, keepdims)]
+jvp_rules[reduce_min_p] = reduce_min_jvp
+
+def reduce_max_jvp(primals, tangents, *, axis, keepdims):
+  (x,), (x_dot,) = primals, tangents
+  return [reduce_max(x, axis, keepdims)], [reduce_max(x_dot, axis, keepdims)]
+jvp_rules[reduce_max_p] = reduce_max_jvp
+
+def argmax_jvp(primals, tangents, *, axis, keepdims):
+  (x,), (x_dot,) = primals, tangents
+  return [argmax(x, axis, keepdims)], [argmax(x_dot, axis, keepdims)]
 jvp_rules[argmax_p] = argmax_jvp
 
-def argmin_jvp(primals, tangents, *, axis):
+def argmin_jvp(primals, tangents, *, axis, keepdims):
   (x,), (x_dot,) = primals, tangents
-  return [argmin(x, axis)], [argmin(x_dot, axis)]
+  return [argmin(x, axis, keepdims)], [argmin(x_dot, axis, keepdims)]
 jvp_rules[argmin_p] = argmin_jvp
 
 def greater_jvp(primals, tangents):
@@ -684,6 +754,32 @@ def moveaxis(x, src: int, dst: int):
   perm.insert(dst, src)
   return transpose(x, perm)
 
+def canonicalize_axis(axis, num_dims) -> int:
+  """Canonicalize an axis in [-num_dims, num_dims) to [0, num_dims)."""
+  axis = operator.index(axis)
+  if not -num_dims <= axis < num_dims:
+    raise ValueError(f"axis {axis} is out of bounds for array of dimension {num_dims}")
+  if axis < 0:
+    axis = axis + num_dims
+  return axis
+
+ndim = np.ndim
+
+def reduction_dims(a, axis):
+  if axis is None:
+    return (tuple(range(ndim(a))),) * 2
+  elif not isinstance(axis, (np.ndarray, tuple, list)):
+    axis = (axis,)
+  #canon_axis = tuple(_canonicalize_axis_allow_named(x, ndim(a))
+    canon_axis = tuple(canonicalize_axis(x, ndim(a))
+                     for x in axis)
+  if len(canon_axis) != len(set(canon_axis)):
+    raise ValueError(f"duplicate value in 'axis': {axis}")
+  canon_pos_axis = tuple(x for x in canon_axis if isinstance(x, int))
+  if len(canon_pos_axis) != len(canon_axis):
+    return canon_pos_axis, canon_axis
+  else:
+    return canon_axis, canon_axis
 
 # -
 
@@ -769,32 +865,46 @@ vmap_rules[cos_p] = partial(vectorized_unop_batching_rule, cos)
 vmap_rules[tanh_p] = partial(vectorized_unop_batching_rule, tanh)
 vmap_rules[neg_p] = partial(vectorized_unop_batching_rule, neg)
 
-def reduce_sum_batching_rule(axis_size, vals_in, dims_in, *, axis):
+def reduce_sum_batching_rule(axis_size, vals_in, dims_in, *, axis, keepdims):
   (x,), (x_bdim,) = vals_in, dims_in
   new_axis = axis + (x_bdim <= axis)
   out_bdim = x_bdim - (new_axis < x_bdim)
-  return [reduce_sum(x, new_axis)], [out_bdim]
+  return [reduce_sum(x, new_axis, keepdims)], [out_bdim]
 vmap_rules[reduce_sum_p] = reduce_sum_batching_rule
 
-def reduce_mean_batching_rule(axis_size, vals_in, dims_in, *, axis):
+def reduce_mean_batching_rule(axis_size, vals_in, dims_in, *, axis, keepdims):
   (x,), (x_bdim,) = vals_in, dims_in
   new_axis = axis + (x_bdim <= axis)
   out_bdim = x_bdim - (new_axis < x_bdim)
-  return [reduce_mean(x, new_axis)], [out_bdim]
+  return [reduce_mean(x, new_axis, keepdims)], [out_bdim]
 vmap_rules[reduce_mean_p] = reduce_mean_batching_rule
 
-def argmin_batching_rule(axis_size, vals_in, dims_in, *, axis):
+def reduce_min_batching_rule(axis_size, vals_in, dims_in, *, axis, keepdims):
   (x,), (x_bdim,) = vals_in, dims_in
   new_axis = axis + (x_bdim <= axis)
   out_bdim = x_bdim - (new_axis < x_bdim)
-  return [argmin(x, new_axis)], [out_bdim]
+  return [reduce_min(x, new_axis, keepdims)], [out_bdim]
+vmap_rules[reduce_min_p] = reduce_min_batching_rule
+
+def reduce_max_batching_rule(axis_size, vals_in, dims_in, *, axis, keepdims):
+  (x,), (x_bdim,) = vals_in, dims_in
+  new_axis = axis + (x_bdim <= axis)
+  out_bdim = x_bdim - (new_axis < x_bdim)
+  return [reduce_max(x, new_axis, keepdims)], [out_bdim]
+vmap_rules[reduce_max_p] = reduce_max_batching_rule
+
+def argmin_batching_rule(axis_size, vals_in, dims_in, *, axis, keepdims):
+  (x,), (x_bdim,) = vals_in, dims_in
+  new_axis = axis + (x_bdim <= axis)
+  out_bdim = x_bdim - (new_axis < x_bdim)
+  return [argmin(x, new_axis, keepdims)], [out_bdim]
 vmap_rules[argmin_p] = argmin_batching_rule
 
-def argmax_batching_rule(axis_size, vals_in, dims_in, *, axis):
+def argmax_batching_rule(axis_size, vals_in, dims_in, *, axis, keepdims):
   (x,), (x_bdim,) = vals_in, dims_in
   new_axis = axis + (x_bdim <= axis)
   out_bdim = x_bdim - (new_axis < x_bdim)
-  return [argmax(x, new_axis)], [out_bdim]
+  return [argmax(x, new_axis, keepdims)], [out_bdim]
 vmap_rules[argmax_p] = argmax_batching_rule
 
 
@@ -1194,11 +1304,16 @@ abstract_eval_rules[cos_p] = vectorized_unop_abstract_eval
 abstract_eval_rules[tanh_p] = vectorized_unop_abstract_eval
 abstract_eval_rules[neg_p] = vectorized_unop_abstract_eval
 
-def reduction_abstract_eval(x: ShapedArray, *, axis: int) -> List[ShapedArray]:
-  new_shape = [d for i, d in enumerate(x.shape) if i != axis]
+def reduction_abstract_eval(x: ShapedArray, *, axis: int, keepdims: bool) -> List[ShapedArray]:
+  if keepdims:
+    new_shape = [1 if i == axis else d for i, d in enumerate(x.shape)]
+  else:
+    new_shape = [d for i, d in enumerate(x.shape) if i != axis]
   return [ShapedArray(tuple(new_shape), x.dtype)]
 abstract_eval_rules[reduce_sum_p] = reduction_abstract_eval
 abstract_eval_rules[reduce_mean_p] = reduction_abstract_eval
+abstract_eval_rules[reduce_min_p] = reduction_abstract_eval
+abstract_eval_rules[reduce_max_p] = reduction_abstract_eval
 abstract_eval_rules[argmin_p] = reduction_abstract_eval
 abstract_eval_rules[argmax_p] = reduction_abstract_eval
 
@@ -1618,7 +1733,7 @@ def direct_translation(op, c, in_avals, in_vals):
 # xla_translations[greater_p] = partial(direct_translation, xops.Gt)
 # xla_translations[less_p] = partial(direct_translation, xops.Lt)
 
-def reduce_sum_translation(c, in_avals, in_vals, *, axis):
+def reduce_sum_translation(c, in_avals, in_vals, *, axis, keepdims):
   (x_aval,), (x,) = in_avals, in_vals
   zero = xops.ConstantLiteral(c, np.array(0, x_aval.dtype))
   subc = xc.XlaBuilder('add')
@@ -2542,11 +2657,16 @@ def add_transpose_rule(cts, x, y):
   return [z_bar, z_bar]
 transpose_rules[add_p] = add_transpose_rule
 
-def reduced_transpose_rule(cts, operand, *, axis):
+def reduced_transpose_rule(cts, operand, *, axis, keepdims):
   cotangent, = cts
   # assert ad.is_undefined_primal(operand)
   input_shape = operand.aval.shape
   broadcast_dimensions = () if axis is None else tuple(np.delete(np.arange(len(input_shape)), axis))
+  if keepdims:
+    broadcast_dimensions  = list(broadcast_dimensions)
+    broadcast_dimensions.insert(axis, 1)
+    broadcast_dimensions = tuple(broadcast_dimensions)
+
   result = broadcast_in_dim(cotangent, input_shape, broadcast_dimensions)
   assert result.shape == input_shape
   return [result]

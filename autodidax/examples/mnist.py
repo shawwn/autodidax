@@ -22,11 +22,15 @@ import time
 
 import numpy.random as npr
 
-from jax import jit, grad
-from jax.scipy.special import logsumexp
-import jax.numpy as jnp
+# from jax import jit, grad
+# from jax.scipy.special import logsumexp
+# import jax.numpy as jnp
 from . import datasets
 import tqdm
+
+import autodidax.numpy as jnp
+from autodidax import jit, grad
+from autodidax.scipy.special import logsumexp
 
 
 def init_random_params(scale, layer_sizes, rng=npr.RandomState(0)):
@@ -76,7 +80,7 @@ if __name__ == "__main__":
         yield train_images[batch_idx], train_labels[batch_idx]
   batches = data_stream()
 
-  @jit
+  # @jit
   def update(params, batch):
     grads = grad(loss)(params, batch)
     return [(w - step_size * dw, b - step_size * db)
