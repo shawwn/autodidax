@@ -29,6 +29,7 @@ neg_p = Primitive("neg")
 sin_p = Primitive("sin")
 cos_p = Primitive("cos")
 reduce_sum_p = Primitive("reduce_sum")
+reduce_mean_p = Primitive("reduce_mean")
 greater_p = Primitive("greater")
 less_p = Primitive("less")
 transpose_p = Primitive("transpose")
@@ -44,6 +45,7 @@ def neg(x): return bind1(neg_p, x)
 def sin(x): return bind1(sin_p, x)
 def cos(x): return bind1(cos_p, x)
 def reduce_sum(x, axis=None): return bind1(reduce_sum_p, x, axis=axis)
+def reduce_mean(x, axis=None): return bind1(reduce_mean_p, x, axis=axis)
 def argmax(x, axis=None): return bind1(argmax_p, x, axis=axis)
 def argmin(x, axis=None): return bind1(argmin_p, x, axis=axis)
 def greater(x, y): return bind1(greater_p, x, y)
@@ -114,6 +116,7 @@ impl_rules[neg_p] = lambda x: [np.negative(x)]
 impl_rules[sin_p] = lambda x: [np.sin(x)]
 impl_rules[cos_p] = lambda x: [np.cos(x)]
 impl_rules[reduce_sum_p] = lambda x, *, axis: [np.sum(x, axis)]
+impl_rules[reduce_mean_p] = lambda x, *, axis: [np.mean(x, axis)]
 impl_rules[argmin_p] = lambda x, *, axis: [np.argmin(x, axis)]
 impl_rules[argmax_p] = lambda x, *, axis: [np.argmax(x, axis)]
 impl_rules[greater_p] = lambda x, y: [np.greater(x, y)]
@@ -391,8 +394,21 @@ def reduce_sum_jvp(primals, tangents, *, axis):
   (x,), (x_dot,) = primals, tangents
   return [reduce_sum(x, axis)], [reduce_sum(x_dot, axis)]
 jvp_rules[reduce_sum_p] = reduce_sum_jvp
-jvp_rules[argmax_p] = reduce_sum_jvp
-jvp_rules[argmin_p] = reduce_sum_jvp
+
+def reduce_mean_jvp(primals, tangents, *, axis):
+  (x,), (x_dot,) = primals, tangents
+  return [reduce_mean(x, axis)], [reduce_mean(x_dot, axis)]
+jvp_rules[reduce_mean_p] = reduce_mean_jvp
+
+def argmax_jvp(primals, tangents, *, axis):
+  (x,), (x_dot,) = primals, tangents
+  return [argmax(x, axis)], [argmax(x_dot, axis)]
+jvp_rules[argmax_p] = argmax_jvp
+
+def argmin_jvp(primals, tangents, *, axis):
+  (x,), (x_dot,) = primals, tangents
+  return [argmin(x, axis)], [argmin(x_dot, axis)]
+jvp_rules[argmin_p] = argmin_jvp
 
 def greater_jvp(primals, tangents):
   (x, y), _ = primals, tangents
@@ -688,8 +704,27 @@ def reduce_sum_batching_rule(axis_size, vals_in, dims_in, *, axis):
   out_bdim = x_bdim - (new_axis < x_bdim)
   return [reduce_sum(x, new_axis)], [out_bdim]
 vmap_rules[reduce_sum_p] = reduce_sum_batching_rule
-vmap_rules[argmin_p] = reduce_sum_batching_rule
-vmap_rules[argmax_p] = reduce_sum_batching_rule
+
+def reduce_mean_batching_rule(axis_size, vals_in, dims_in, *, axis):
+  (x,), (x_bdim,) = vals_in, dims_in
+  new_axis = axis + (x_bdim <= axis)
+  out_bdim = x_bdim - (new_axis < x_bdim)
+  return [reduce_mean(x, new_axis)], [out_bdim]
+vmap_rules[reduce_mean_p] = reduce_mean_batching_rule
+
+def argmin_batching_rule(axis_size, vals_in, dims_in, *, axis):
+  (x,), (x_bdim,) = vals_in, dims_in
+  new_axis = axis + (x_bdim <= axis)
+  out_bdim = x_bdim - (new_axis < x_bdim)
+  return [argmin(x, new_axis)], [out_bdim]
+vmap_rules[argmin_p] = argmin_batching_rule
+
+def argmax_batching_rule(axis_size, vals_in, dims_in, *, axis):
+  (x,), (x_bdim,) = vals_in, dims_in
+  new_axis = axis + (x_bdim <= axis)
+  out_bdim = x_bdim - (new_axis < x_bdim)
+  return [argmax(x, new_axis)], [out_bdim]
+vmap_rules[argmax_p] = argmax_batching_rule
 
 
 # -
@@ -1087,12 +1122,13 @@ abstract_eval_rules[sin_p] = vectorized_unop_abstract_eval
 abstract_eval_rules[cos_p] = vectorized_unop_abstract_eval
 abstract_eval_rules[neg_p] = vectorized_unop_abstract_eval
 
-def reduce_sum_abstract_eval(x: ShapedArray, *, axis: int) -> List[ShapedArray]:
+def reduction_abstract_eval(x: ShapedArray, *, axis: int) -> List[ShapedArray]:
   new_shape = [d for i, d in enumerate(x.shape) if i != axis]
   return [ShapedArray(tuple(new_shape), x.dtype)]
-abstract_eval_rules[reduce_sum_p] = reduce_sum_abstract_eval
-abstract_eval_rules[argmin_p] = reduce_sum_abstract_eval
-abstract_eval_rules[argmax_p] = reduce_sum_abstract_eval
+abstract_eval_rules[reduce_sum_p] = reduction_abstract_eval
+abstract_eval_rules[reduce_mean_p] = reduction_abstract_eval
+abstract_eval_rules[argmin_p] = reduction_abstract_eval
+abstract_eval_rules[argmax_p] = reduction_abstract_eval
 
 def broadcast_abstract_eval(x: ShapedArray, *, shape: Sequence[int],
                             axes: Sequence[int]) -> List[ShapedArray]:
@@ -2433,7 +2469,7 @@ def add_transpose_rule(cts, x, y):
   return [z_bar, z_bar]
 transpose_rules[add_p] = add_transpose_rule
 
-def reduce_sum_transpose_rule(cts, operand, *, axis):
+def reduced_transpose_rule(cts, operand, *, axis):
   cotangent, = cts
   # assert ad.is_undefined_primal(operand)
   input_shape = operand.aval.shape
@@ -2441,7 +2477,10 @@ def reduce_sum_transpose_rule(cts, operand, *, axis):
   result = broadcast_in_dim(cotangent, input_shape, broadcast_dimensions)
   assert result.shape == input_shape
   return [result]
-transpose_rules[reduce_sum_p] = reduce_sum_transpose_rule
+transpose_rules[reduce_sum_p] = reduced_transpose_rule
+transpose_rules[reduce_mean_p] = reduced_transpose_rule
+transpose_rules[argmax_p] = reduced_transpose_rule
+transpose_rules[argmin_p] = reduced_transpose_rule
 
 
 def xla_call_transpose_rule(cts, *invals, jaxpr, num_consts):
