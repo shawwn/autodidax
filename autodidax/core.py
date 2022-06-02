@@ -1190,3 +1190,447 @@ def make_jaxpr(f: Callable, *avals_in: ShapedArray,
 jaxpr, consts, _ = make_jaxpr(lambda: mul(2., 2.))
 print(jaxpr)
 
+# -
+
+# Using `dynamic_trace` this way is conceptually the same as stashing the
+# current interpreter stack and starting a new one with the `JaxprTrace` at the
+# bottom. That is, no interpreters lower in the stack than the `dynamic_trace`
+# are applied (since `JaxprTrace.process_primitive` doesn't call `bind`), though
+# if the Python callable being traced to a jaxpr itself uses transformations
+# then those can be pushed onto the interpreter stack above the `JaxprTrace`.
+# But temporarily stashing the interpreter stack would break up the system
+# state. The `dynamic_trace` tag achieves the same goals while keeping the
+# system state simpler.
+
+# That's it for jaxprs! With jaxprs in hand, we can implement the remaining
+# major JAX features.
+
+# ## Part 3: `jit`, simplified
+#
+# While `jit` has a transformation-like API in that it accepts a Python callable
+# as an argument, under the hood it's really a higher-order primitive rather
+# than a transformation. A primitive is _higher-order_ when it's parameterized
+# by a function.
+
+# ### On-the-fly ("final style") and staged ("initial style") processing
+#
+# There are two options for how to handle higher-order primitives. Each requires
+# a different approach to tracing and engenders different tradeoffs:
+# 1. **On-the-fly processing, where `bind` takes a Python callable as an
+#    argument.** We defer forming a jaxpr until as late as possible, namely
+#    until we're running the final interpreter at the bottom of the interpreter
+#    stack. That way we can swap a `JaxprTrace` in at the bottom of the
+#    interpreter stack and thus stage out rather than execute all primitive
+#    operations. With this approach, transformations in the stack get applied as
+#    we execute the Python callable as usual. This approach can be very tricky
+#    to implement, but it's as general as possible because it allows
+#    higher-order primitives not to raise the abstraction level of their
+#    arguments and thus allows data-dependent Python control flow. We refer to
+#    this approach as using a "final-style higher-order primitive" employing the
+#    discharge-at-tracing-time "final-style transformations" we've used so far.
+# 2. **Staged processing, where `bind` takes a jaxpr as an argument.** Before we
+#    call `bind`, in the primitive wrapper we can just use `make_jaxpr` to form
+#    a jaxpr up-front and be done with the Python callable entirely. In this
+#    case, `make_jaxpr` puts its `JaxprTrace` at the top of the interpreter
+#    stack, and no transformations lower in the stack, which might enter via
+#    closed-over Tracers, are applied to the Python callable as we trace it.
+#    (Transformations applied within the Python callable are applied as usual,
+#    being added to the stack above the JaxprTrace.) Instead, the
+#    transformations lower in the stack are later applied to the call primitive,
+#    and the call primitive's rules must then transform the jaxpr itself.
+#    Because we trace to a jaxpr up-front, this approach can't support
+#    data-dependent Python control flow, but it is more straightforward to
+#    implement. We refer to this kind of higher-order primitive as an
+#    "initial-style higher-order primitive", and say that its jaxpr-processing
+#    transformation rules are "initial-style transformation rules."
+#
+# The latter approach fits for `jit` because we don't need to support
+# data-dependent Python control flow in the user-provided Python callable, as
+# the whole purpose of `jit` is to stage computation out of Python to be
+# executed by XLA. (In contrast, `custom_jvp` is a higher-order primitive in
+# which we want to support data-dependent Python control flow.)
+#
+# Historically, we started using the "initial-style" and "final-style"
+# terminology after reading the [typed tagless final
+# interpreters](http://okmij.org/ftp/tagless-final/index.html) paper, and
+# jokingly referring to JAX as an implementation of "untyped tagful final
+# interpreters." We don't claim to carry over (or understand) any deep meaning
+# behind these terms; we loosely use "initial style" to mean "build an AST and
+# then transform it", and we use "final style" to mean "transform as we trace."
+# But it's just imprecise yet sticky jargon.
+
+# With the initial-style approach, here's the user-facing `jit` wrapper:
+
+# +
+def jit(f):
+  def f_jitted(*args):
+    avals_in = [raise_to_shaped(get_aval(x)) for x in args]
+    jaxpr, consts, out_tree = make_jaxpr(f, *avals_in)
+    outs = bind(xla_call_p, *consts, *args, jaxpr=jaxpr, num_consts=len(consts))
+    out = tree_unflatten(out_tree, outs)
+    # breakpoint()
+    return out
+  return f_jitted
+
+xla_call_p = Primitive('xla_call')
+
+
+# -
+
+# With any new primitive, we need to give it transformation rules, starting with
+# its evaluation rule. When we evaluate an application of the `xla_call`
+# primitive, we want to stage out out the computation to XLA. That involves
+# translating the jaxpr to an XLA HLO program, transferring the argument values
+# to the XLA device, executing the XLA program, and transferring back the
+# results. We'll cache the XLA HLO compilation so that for each `jit`ted
+# function it only needs to be performed once per argument shape and dtype
+# signature.
+#
+# First, some utilities.
+
+class IDHashable:
+  val: Any
+
+  def __init__(self, val):
+    self.val = val
+
+  def __hash__(self) -> int:
+    return id(self.val)
+
+  def __eq__(self, other):
+    return type(other) is IDHashable and id(self.val) == id(other.val)
+
+# Next, we'll define the evaluation rule for `xla_call`:
+
+# +
+from jax._src.lib import xla_bridge as xb
+from jax._src.lib import xla_client as xc
+xe = xc._xla
+xops = xc._xla.ops
+
+def xla_call_impl(*args, jaxpr: Jaxpr, num_consts: int):
+  # consts, args = args[:num_consts], args[num_consts:]
+  # hashable_consts = tuple(map(IDHashable, consts))
+  # execute = xla_callable(IDHashable(jaxpr), hashable_consts)
+  execute = jaxpr_as_fun(jaxpr)
+  out = execute(*args)
+  return out
+impl_rules[xla_call_p] = xla_call_impl
+
+# @lru_cache()
+# def xla_callable(hashable_jaxpr: IDHashable, hashable_consts: Tuple[IDHashable]):
+#   jaxpr: Jaxpr = hashable_jaxpr.val
+#   typecheck_jaxpr(jaxpr)
+#   consts = [x.val for x in hashable_consts]
+#   in_avals = [v.aval for v in jaxpr.in_binders[len(consts):]]
+#   c = xc.XlaBuilder('xla_call')
+#   xla_consts = _xla_consts(c, consts)
+#   xla_params = _xla_params(c, in_avals)
+#   outs = jaxpr_subcomp(c, jaxpr, xla_consts + xla_params)
+#   out = xops.Tuple(c, outs)
+#   compiled = xb.get_backend(None).compile(c.build(out))
+#   return partial(execute_compiled, compiled, [v.aval for v in jaxpr.outs])
+#
+# def _xla_consts(c: xe.XlaBuilder, consts: List[Any]) -> List[xe.XlaOp]:
+#   unique_consts = {id(cnst): cnst for cnst in consts}
+#   xla_consts = {
+#       id_: xops.ConstantLiteral(c, cnst) for id_, cnst in unique_consts.items()}
+#   return [xla_consts[id(cnst)] for cnst in consts]
+#
+# def _xla_params(c: xe.XlaBuilder, avals_in: List[ShapedArray]) -> List[xe.XlaOp]:
+#   return [xops.Parameter(c, i, _xla_shape(a)) for i, a in enumerate(avals_in)]
+#
+# def _xla_shape(aval: ShapedArray) -> xe.Shape:
+#   return xc.Shape.array_shape(xc.dtype_to_etype(aval.dtype), aval.shape)
+
+
+# -
+
+# The main action is in `xla_callable`, which compiles a jaxpr into an XLA HLO
+# program using `jaxpr_subcomp`, then returns a callable which executes the
+# compiled program:
+
+# +
+def jaxpr_subcomp(c: xe.XlaBuilder, jaxpr: Jaxpr, args: List[xe.XlaOp]
+                  ) -> xe.XlaOp:
+  env: Dict[Var, xe.XlaOp] = {}
+
+  def read(x: Atom) -> xe.XlaOp:
+    return env[x] if type(x) is Var else xops.Constant(c, np.asarray(x.val))
+
+  def write(v: Var, val: xe.XlaOp) -> None:
+    env[v] = val
+
+  map(write, jaxpr.in_binders, args)
+  for eqn in jaxpr.eqns:
+    in_avals = [x.aval for x in eqn.inputs]
+    in_vals = map(read, eqn.inputs)
+    rule = xla_translations[eqn.primitive]
+    out_vals = rule(c, in_avals, in_vals, **eqn.params)
+    map(write, eqn.out_binders, out_vals)
+  return map(read, jaxpr.outs)
+
+def execute_compiled(compiled, out_avals, *args):
+  input_bufs = [input_handlers[type(x)](x) for x in args]
+  out_bufs = compiled.execute(input_bufs)
+  return [handle_result(aval, buf) for aval, buf in zip(out_avals, out_bufs)]
+
+default_input_handler = xb.get_backend(None).buffer_from_pyval
+input_handlers = {ty: default_input_handler for ty in
+                  [bool, int, float, np.ndarray, np.float64, np.float32]}
+
+def handle_result(aval: ShapedArray, buf):
+  del aval  # Unused for now
+  return buf.to_py()
+
+xla_translations = {}
+
+
+# -
+
+# Notice that `jaxpr_subcomp` has the structure of a simple interpreter. That's
+# a common pattern: the way we process jaxprs is usually with an interpreter.
+# And as with any interpreter, we need an interpretation rule for each
+# primitive:
+
+# +
+def direct_translation(op, c, in_avals, in_vals):
+  del c, in_avals
+  return [op(*in_vals)]
+
+xla_translations[add_p] = partial(direct_translation, xops.Add)
+xla_translations[mul_p] = partial(direct_translation, xops.Mul)
+xla_translations[neg_p] = partial(direct_translation, xops.Neg)
+xla_translations[sin_p] = partial(direct_translation, xops.Sin)
+xla_translations[cos_p] = partial(direct_translation, xops.Cos)
+xla_translations[greater_p] = partial(direct_translation, xops.Gt)
+xla_translations[less_p] = partial(direct_translation, xops.Lt)
+
+def reduce_sum_translation(c, in_avals, in_vals, *, axis):
+  (x_aval,), (x,) = in_avals, in_vals
+  zero = xops.ConstantLiteral(c, np.array(0, x_aval.dtype))
+  subc = xc.XlaBuilder('add')
+  shape = _xla_shape(ShapedArray((), x_aval.dtype))
+  xops.Add(xops.Parameter(subc, 0, shape), xops.Parameter(subc, 1, shape))
+  return [xops.Reduce(c, [x], [zero], subc.build(), [axis])]
+xla_translations[reduce_sum_p] = reduce_sum_translation
+
+def broadcast_translation(c, in_avals, in_vals, *, shape, axes):
+  x, = in_vals
+  dims_complement = [i for i in range(len(shape)) if i not in axes]
+  return [xops.BroadcastInDim(x, shape, dims_complement)]
+xla_translations[broadcast_p] = broadcast_translation
+
+
+# -
+
+# With that, we can now use `jit` to stage out, compile, and execute programs
+# with XLA!
+
+@jit
+def f(x, y):
+  print('tracing!')
+  return sin(x) * cos(y)
+
+
+z = f(3., 4.)  # 'tracing!' prints the first time
+print(z)
+
+z = f(4., 5.)  # 'tracing!' doesn't print, compilation cache hit!
+print(z)
+
+
+# +
+@jit
+def f(x):
+  return reduce_sum(x, axis=0)
+
+print(f(np.array([1., 2., 3.])))
+
+
+# +
+def f(x):
+  y = sin(x) * 2.
+  z = - y + x
+  return z
+
+def deriv(f):
+  return lambda x: jvp(f, (x,), (1.,))[1]
+
+print(    deriv(deriv(f))(3.))
+print(jit(deriv(deriv(f)))(3.))
+
+
+# -
+
+# Instead of implementing `jit` to first trace to a jaxpr and then to lower the
+# jaxpr to XLA HLO, it might appear that we could have skipped the jaxpr step
+# and just lowered to HLO while tracing. That is, perhaps we could have instead
+# implemented `jit` with a `Trace` and `Tracer` that appended to the XLA HLO
+# graph incrementally on each primitive bind. That's correct for now, but won't
+# be possible when we introduce compiled SPMD computations because there we must
+# know the number of replicas needed before compiling the program.
+
+# We haven't yet defined any transformation rules for `xla_call_p` other than
+# its evaluation rule. That is, we can't yet do `vmap`-of-`jit` or
+# `jvp`-of-`jit` or even `jit`-of`-jit`. Instead `jit` has to be at the "top
+# level." Let's fix that!
+
+# +
+def xla_call_jvp_rule(primals, tangents, *, jaxpr, num_consts):
+  del num_consts  # Unused
+  new_jaxpr, new_consts = jvp_jaxpr(jaxpr)
+  outs = bind(xla_call_p, *new_consts, *primals, *tangents, jaxpr=new_jaxpr,
+              num_consts=len(new_consts))
+  n = len(outs) // 2
+  primals_out, tangents_out = outs[:n], outs[n:]
+  return primals_out, tangents_out
+jvp_rules[xla_call_p] = xla_call_jvp_rule
+
+@lru_cache()
+def jvp_jaxpr(jaxpr: Jaxpr) -> Tuple[Jaxpr, List[Any]]:
+  def jvp_traceable(*primals_and_tangents):
+    n = len(primals_and_tangents) // 2
+    primals, tangents = primals_and_tangents[:n], primals_and_tangents[n:]
+    return jvp(jaxpr_as_fun(jaxpr), primals, tangents)
+
+  in_avals = [v.aval for v in jaxpr.in_binders]
+  new_jaxpr, new_consts, _ = make_jaxpr(jvp_traceable, *in_avals, *in_avals)
+  return new_jaxpr, new_consts
+
+
+# +
+def xla_call_vmap_rule(axis_size, vals_in, dims_in, *, jaxpr, num_consts):
+  del num_consts  # Unused
+  new_jaxpr, new_consts = vmap_jaxpr(jaxpr, axis_size, tuple(dims_in))
+  outs = bind(xla_call_p, *new_consts, *vals_in, jaxpr=new_jaxpr,
+              num_consts=len(new_consts))
+  return outs, [0] * len(outs)
+vmap_rules[xla_call_p] = xla_call_vmap_rule
+
+@lru_cache()
+def vmap_jaxpr(jaxpr: Jaxpr, axis_size: int, bdims_in: Tuple[BatchAxis, ...]
+               ) -> Tuple[Jaxpr, List[Any]]:
+  vmap_traceable = vmap(jaxpr_as_fun(jaxpr), tuple(bdims_in))
+  in_avals = [unmapped_aval(axis_size, d, v.aval)
+              for v, d in zip(jaxpr.in_binders, bdims_in)]
+  new_jaxpr, new_consts, _ = make_jaxpr(vmap_traceable, *in_avals)
+  return new_jaxpr, new_consts
+
+def unmapped_aval(axis_size: int, batch_dim: BatchAxis, aval: ShapedArray
+                  ) -> ShapedArray:
+  if batch_dim is not_mapped:
+    return aval
+  else:
+    shape = list(aval.shape)
+    shape.insert(batch_dim, axis_size)
+    return ShapedArray(tuple(shape), aval.dtype)
+
+
+# +
+def xla_call_abstract_eval_rule(*in_types, jaxpr, num_consts):
+  del num_consts  # Unused
+  jaxpr_type = typecheck_jaxpr(jaxpr)
+  if not all(t1 == t2 for t1, t2 in zip(jaxpr_type.in_types, in_types)):
+    raise TypeError
+  return jaxpr_type.out_types
+abstract_eval_rules[xla_call_p] = xla_call_abstract_eval_rule
+
+def xla_call_translation(c, in_avals, in_vals, *, jaxpr, num_consts):
+  del num_consts  # Only used at top-level.
+  # Calling jaxpr_subcomp directly would inline. We generate a Call HLO instead.
+  subc = xc.XlaBuilder('inner xla_call')
+  xla_params = _xla_params(subc, in_avals)
+  outs = jaxpr_subcomp(subc, jaxpr, xla_params)
+  subc = subc.build(xops.Tuple(subc, outs))
+  return destructure_tuple(c, xops.Call(c, subc, in_vals))
+xla_translations[xla_call_p] = xla_call_translation
+
+def destructure_tuple(c, tup):
+  num_elements = len(c.get_shape(tup).tuple_shapes())
+  return [xops.GetTupleElement(tup, i) for i in range(num_elements)]
+
+
+# +
+@jit
+def f(x):
+  print('tracing!')
+  y = sin(x) * 2.
+  z = - y + x
+  return z
+
+x, xdot = 3., 1.
+y, ydot = jvp(f, (x,), (xdot,))
+print(y)
+print(ydot)
+# -
+
+y, ydot = jvp(f, (x,), (xdot,))  # 'tracing!' not printed
+
+ys = vmap(f, (0,))(np.arange(3.))
+print(ys)
+
+
+# One piece missing is device memory persistence for arrays. That is, we've
+# defined `handle_result` to transfer results back to CPU memory as NumPy
+# arrays, but it's often preferable to avoid transferring results just to
+# transfer them back for the next operation. We can do that by introducing a
+# `DeviceArray` class, which can wrap XLA buffers and otherwise duck-type
+# `numpy.ndarray`s:
+
+# +
+def handle_result(aval: ShapedArray, buf):  # noqa: F811
+  return DeviceArray(aval, buf)
+
+class DeviceArray:
+  buf: Any
+  aval: ShapedArray
+
+  def __init__(self, aval, buf):
+    self.aval = aval
+    self.buf = buf
+
+  dtype = property(lambda self: self.aval.dtype)
+  shape = property(lambda self: self.aval.shape)
+  ndim  = property(lambda self: self.aval.ndim)
+
+  def __array__(self): return self.buf.to_py()
+  def __repr__(self):  return repr(self.buf.to_py())
+  def __str__(self):   return str(self.buf.to_py())
+
+  _neg = staticmethod(neg)
+  _add = staticmethod(add)
+  _radd = staticmethod(add)
+  _mul = staticmethod(mul)
+  _rmul = staticmethod(mul)
+  _gt = staticmethod(greater)
+  _lt = staticmethod(less)
+input_handlers[DeviceArray] = lambda x: x.buf
+
+jax_types.add(DeviceArray)
+
+
+# +
+@jit
+def f(x):
+  y = sin(x) * 2.
+  z = - y + x
+  return z
+
+x, xdot = 3., 1.
+y, ydot = jvp(f, (x,), (xdot,))
+print(y)
+print(ydot)
+
+
+# + tags=["hide-input"]
+def pprint_xla_call(names: DefaultDict[Var, str], eqn: JaxprEqn) -> PPrint:
+  lhs = pp(' '.join(var_str(names, v) for v in eqn.out_binders))
+  params_without_jaxpr = {k:v for k, v in eqn.params.items() if k != 'jaxpr'}
+  rhs = (pp(eqn.primitive.name) >> pp_params(params_without_jaxpr) >>
+         pp(' '.join(names[x] if isinstance(x, Var) else str(x.val)
+                     for x in eqn.inputs)))
+  return vcat([lhs >> pp(' = ') >> rhs,
+               pp_jaxpr(eqn.params['jaxpr']).indent(2)])
+pp_rules[xla_call_p] = pprint_xla_call
+
