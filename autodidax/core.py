@@ -149,6 +149,77 @@ class Tracer:
 
 def swap(f): return lambda x, y: f(y, x)
 
+# +
+class ShapedArray:
+  array_abstraction_level = 1
+  shape: Tuple[int]
+  dtype: np.dtype
+
+  def __init__(self, shape, dtype):
+    self.shape = shape
+    self.dtype = dtype
+
+  @property
+  def ndim(self):
+    return len(self.shape)
+
+  _neg = staticmethod(neg)
+  _add = staticmethod(add)
+  _radd = staticmethod(swap(add))
+  _mul = staticmethod(mul)
+  _rmul = staticmethod(swap(mul))
+  _gt = staticmethod(greater)
+  _lt = staticmethod(less)
+
+  @staticmethod
+  def _bool(tracer):
+    raise Exception("ShapedArray can't be unambiguously converted to bool")
+
+  @staticmethod
+  def _nonzero(tracer):
+    raise Exception("ShapedArray can't be unambiguously converted to bool")
+
+  def str_short(self):
+    return f'{self.dtype.name}[{",".join(str(d) for d in self.shape)}]'
+
+  def __hash__(self):
+    return hash((self.shape, self.dtype))
+
+  def __eq__(self, other):
+    return (type(self) is type(other) and
+            self.shape == other.shape and self.dtype == other.dtype)
+
+  def __repr__(self):
+    return f"ShapedArray(shape={self.shape}, dtype={self.dtype})"
+
+class ConcreteArray(ShapedArray):
+  array_abstraction_level = 2
+  val: np.ndarray
+
+  def __init__(self, val):
+    self.val = val
+    self.shape = val.shape
+    self.dtype = val.dtype
+
+  @staticmethod
+  def _bool(tracer):
+    return bool(tracer.aval.val)
+
+  @staticmethod
+  def _nonzero(tracer):
+    return bool(tracer.aval.val)
+
+def get_aval(x):
+  if isinstance(x, Tracer):
+    return x.aval
+  elif type(x) in jax_types:
+    return ConcreteArray(np.asarray(x))
+  else:
+    raise TypeError(x)
+
+jax_types = {bool, int, float,
+             np.bool_, np.int32, np.int64, np.float32, np.float64, np.ndarray}
+
 # ---------------
 
 def full_lower(val: Any):
@@ -173,25 +244,132 @@ def full_raise(trace: Trace, val: Any) -> Tracer:
 
 # ---------------
 
-jax_types = {bool, int, float,
-             np.bool_, np.int32, np.int64, np.float32, np.float64, np.ndarray}
-
-# ---------------
-
-def f(x):
-  y = sin(x) * 2.
-  z = - y + x
-  return z
+def get_aval(x):
+  if isinstance(x, Tracer):
+    return x.aval
+  elif type(x) in jax_types:
+    return ConcreteArray(np.asarray(x))
+  else:
+    raise TypeError(x)
 
 
-print(f(3.0))
-print(f(np.ones((3,3))))
+# ### Forward-mode autodiff with `jvp`
+#
+# First, a few helper functions:
 
-# ---------------
+# +
+def zeros_like(val):
+  aval = get_aval(val)
+  return np.zeros(aval.shape, aval.dtype)
 
-def g(x):
-  y = reduce_sum(x, axis=0)
-  return y
+def unzip2(pairs):
+  lst1, lst2 = [], []
+  for x1, x2 in pairs:
+    lst1.append(x1)
+    lst2.append(x2)
+  return lst1, lst2
 
-print(g(np.ones((3,3))))
+map_ = map
+def map(f, *xs):
+  return list(map_(f, *xs))
 
+zip_ = zip
+def zip(*args):
+  fst, *rest = args = map(list, args)
+  n = len(fst)
+  for arg in rest:
+    assert len(arg) == n
+  return list(zip_(*args))
+
+
+# -
+
+# The `Tracer` for forward-mode autodiff carries a primal-tangent pair. The
+# `Trace` applies JVP rules.
+
+# +
+class JVPTracer(Tracer):
+  def __init__(self, trace, primal, tangent):
+    self._trace = trace
+    self.primal = primal
+    self.tangent = tangent
+
+  @property
+  def aval(self):
+    return get_aval(self.primal)
+
+class JVPTrace(Trace):
+  pure = lift = lambda self, val: JVPTracer(self, val, zeros_like(val))
+
+  def process_primitive(self, primitive, tracers, params):
+    primals_in, tangents_in = unzip2((t.primal, t.tangent) for t in tracers)
+    jvp_rule = jvp_rules[primitive]
+    primal_outs, tangent_outs = jvp_rule(primals_in, tangents_in, **params)
+    return [JVPTracer(self, x, t) for x, t in zip(primal_outs, tangent_outs)]
+
+jvp_rules = {}
+
+
+# -
+
+# Notice both `pure` and `lift` package a value into a `JVPTracer` with the
+# minimal amount of context, which is a zero tangent value.
+#
+# Let's add some JVP rules for primitives:
+
+# +
+def add_jvp(primals, tangents):
+  (x, y), (x_dot, y_dot) = primals, tangents
+  return [x + y], [x_dot + y_dot]
+jvp_rules[add_p] = add_jvp
+
+def mul_jvp(primals, tangents):
+  (x, y), (x_dot, y_dot) = primals, tangents
+  return [x * y], [x_dot * y + x * y_dot]
+jvp_rules[mul_p] = mul_jvp
+
+def sin_jvp(primals, tangents):
+  (x,), (x_dot,) = primals, tangents
+  return [sin(x)], [cos(x) * x_dot]
+jvp_rules[sin_p] = sin_jvp
+
+def cos_jvp(primals, tangents):
+  (x,), (x_dot,) = primals, tangents
+  return [cos(x)], [-sin(x) * x_dot]
+jvp_rules[cos_p] = cos_jvp
+
+def neg_jvp(primals, tangents):
+  (x,), (x_dot,) = primals, tangents
+  return [neg(x)], [neg(x_dot)]
+jvp_rules[neg_p] = neg_jvp
+
+def reduce_sum_jvp(primals, tangents, *, axis):
+  (x,), (x_dot,) = primals, tangents
+  return [reduce_sum(x, axis)], [reduce_sum(x_dot, axis)]
+jvp_rules[reduce_sum_p] = reduce_sum_jvp
+
+def greater_jvp(primals, tangents):
+  (x, y), _ = primals, tangents
+  out_primal = greater(x, y)
+  return [out_primal], [zeros_like(out_primal)]
+jvp_rules[greater_p] = greater_jvp
+
+def less_jvp(primals, tangents):
+  (x, y), _ = primals, tangents
+  out_primal = less(x, y)
+  return [out_primal], [zeros_like(out_primal)]
+jvp_rules[less_p] = less_jvp
+
+
+# -
+
+# Finally, we add a transformation API to kick off the trace:
+
+def jvp_v1(f, primals, tangents):
+  with new_main(JVPTrace) as main:
+    trace = JVPTrace(main)
+    tracers_in = [JVPTracer(trace, x, t) for x, t in zip(primals, tangents)]
+    out = f(*tracers_in)
+    tracer_out = full_raise(trace, out)
+    primal_out, tangent_out = tracer_out.primal, tracer_out.tangent
+  return primal_out, tangent_out
