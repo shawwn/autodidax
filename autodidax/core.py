@@ -13,18 +13,40 @@ from __future__ import annotations
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import NamedTuple
+from typing import *
 import functools
 import operator
 from functools import partial
 
 import sys as _sys
-core = _sys.modules[__name__]
+core = api_util = _sys.modules[__name__]
 
-print = lambda *args: None
+# print = lambda *args: None
+
+### Operations on shapes and dimension sizes.
+
+# Shapes are tuples of dimension sizes, which are normally integers. We allow
+# modules to extend the set of dimension sizes to contain other types, e.g.,
+# symbolic dimensions in jax2tf.shape_poly.DimVar and masking.Poly.
+DimSize = Union[int, Any]  # extensible
+Shape = Sequence[DimSize]
+
+Array = Any
+DType = Any
+
+
+
+abstract_eval_rules = {}
 
 class Primitive(NamedTuple):
   name: str
+  multiple_results: bool = False
+  def bind(self, *args, **kws):
+    return bind(self, *args, **kws)
+  def def_impl(self, f):
+    impl_rules[self] = f
+  def def_abstract_eval(self, f):
+    abstract_eval_rules[self] = f
 
 add_p = Primitive('add')
 mul_p = Primitive('mul')
@@ -46,6 +68,7 @@ broadcast_p = Primitive("broadcast")
 broadcast_in_dim_p = Primitive("broadcast_in_dim")
 argmin_p = Primitive("argmin")
 argmax_p = Primitive("argmax")
+dot_general_p = Primitive("dot_general")
 
 def add(x, y): return bind1(add_p, x, y)
 def sub(x, y): return add(x, neg(y))
@@ -86,6 +109,86 @@ def expand_dims(array: Array, dimensions: Sequence[int]) -> Array:
     result_shape.insert(i, 1)
   broadcast_dims = [i for i in range(ndim_out) if i not in dims_set]
   return broadcast_in_dim(array, result_shape, broadcast_dims)
+
+def dot(lhs: Array, rhs: Array, precision: PrecisionLike = None,
+        preferred_element_type: Optional[DType] = None) -> Array:
+  """Vector/vector, matrix/vector, and matrix/matrix multiplication.
+
+  Wraps XLA's `Dot
+  <https://www.tensorflow.org/xla/operation_semantics#dot>`_
+  operator.
+
+  For more general contraction, see the `dot_general` operator.
+
+  Args:
+    lhs: an array of rank 1 or 2.
+    rhs: an array of rank 1 or 2.
+    precision: Optional. Either ``None``, which means the default precision for
+      the backend, a :class:`~jax.lax.Precision` enum value (``Precision.DEFAULT``,
+      ``Precision.HIGH`` or ``Precision.HIGHEST``) or a tuple of two
+      :class:`~jax.lax.Precision` enums indicating precision of ``lhs``` and ``rhs``.
+    preferred_element_type: Optional. Either ``None``, which means the default
+      accumulation type for the input types, or a datatype, indicating to
+      accumulate results to and return a result with that datatype.
+
+  Returns:
+    An array containing the product.
+  """
+  if 1 <= lhs.ndim <= 2 and 1 <= rhs.ndim <= 2 and core.symbolic_equal_dim(lhs.shape[-1], rhs.shape[0]):
+    return dot_general(lhs, rhs, (((lhs.ndim - 1,), (0,)), ((), ())),
+                       precision=precision,
+                       preferred_element_type=preferred_element_type)
+  else:
+    raise TypeError("Incompatible shapes for dot: got {} and {}.".format(
+        lhs.shape, rhs.shape))
+
+
+DotDimensionNumbers = Tuple[Tuple[Sequence[int], Sequence[int]],
+                            Tuple[Sequence[int], Sequence[int]]]
+
+def dot_general(lhs: Array, rhs: Array, dimension_numbers: DotDimensionNumbers,
+                precision: PrecisionLike = None,
+                preferred_element_type: Optional[DType] = None) -> Array:
+  """More general contraction operator.
+
+  Wraps XLA's `DotGeneral
+  <https://www.tensorflow.org/xla/operation_semantics#dotgeneral>`_
+  operator.
+
+  Args:
+    lhs: an array
+    rhs: an array
+    dimension_numbers: a tuple of tuples of the form
+      `((lhs_contracting_dims, rhs_contracting_dims),
+      (lhs_batch_dims, rhs_batch_dims))`
+    precision: Optional. Either ``None``, which means the default precision for
+      the backend, a :class:`~jax.lax.Precision` enum value (``Precision.DEFAULT``,
+      ``Precision.HIGH`` or ``Precision.HIGHEST``) or a tuple of two
+      :class:`~jax.lax.Precision` enums indicating precision of ``lhs``` and ``rhs``.
+    preferred_element_type: Optional. Either ``None``, which means the default
+      accumulation type for the input types, or a datatype, indicating to
+      accumulate results to and return a result with that datatype.
+
+  Returns:
+    An array containing the result.
+  """
+  (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
+  cdims = (_ensure_index_tuple(lhs_contract),
+           _ensure_index_tuple(rhs_contract))
+  bdims = (_ensure_index_tuple(lhs_batch),
+           _ensure_index_tuple(rhs_batch))
+  preferred_element_type = (
+      None if preferred_element_type is None else
+      dtypes.canonicalize_dtype(np.dtype(preferred_element_type)))
+  return dot_general_p.bind(lhs, rhs,
+                            dimension_numbers=(cdims, bdims),
+                            precision=canonicalize_precision(precision),
+                            preferred_element_type=preferred_element_type)
+
+def canonicalize_precision(precision: PrecisionLike) -> Optional[Tuple[PrecisionType, PrecisionType]]:
+  return precision
+
+
 
 def bind1(prim, *args, **params):
   out, = bind(prim, *args, **params)
@@ -212,6 +315,9 @@ class Tracer:
   @property
   def aval(self):
     assert False  # must override
+
+  def __repr__(self):
+    return f"{type(self).__name__}(aval={self.aval!r})"
 
   def full_lower(self):
     return self  # default implementation
@@ -410,41 +516,87 @@ class JVPTrace(Trace):
 jvp_rules = {}
 
 
-# TODO
-# def defjvp(primitive, *jvprules):
-#   assert isinstance(primitive, Primitive)
-#   # assert not primitive.multiple_results
-#   jvp_rules[primitive] = partial(standard_jvp, jvprules, primitive)
-#
-#
-# def standard_jvp(jvprules, primitive, primals, tangents, **params):
-#   val_out = primitive.bind(*primals, **params)
-#   tangents_out = [rule(t, *primals, **params) for rule, t in zip(jvprules, tangents)
-#                   if rule is not None and type(t) is not Zero]
-#   return val_out, functools.reduce(add_tangents, tangents_out, Zero.from_value(val_out))
-#
-# def defjvp2(primitive, *jvprules):
-#   assert isinstance(primitive, Primitive)
-#   # assert not primitive.multiple_results
-#   jvp_rules[primitive] = partial(standard_jvp2, jvprules, primitive)
-#
-# def standard_jvp2(jvprules, primitive, primals, tangents, **params):
-#   val_out, = bind(primitive, *primals, **params)
-#   tangents_out = (rule(t, val_out, *primals, **params) for rule, t in zip(jvprules, tangents)
-#                   if rule is not None and type(t) is not Zero)
-#   tangents_out = list(tangents_out)
-#   breakpoint()
-#   return val_out, functools.reduce(add_tangents, tangents_out, Zero.from_value(val_out))
-#
-# def add_tangents(x, y):
-#   if type(x) is Zero:
-#     return y
-#   elif type(y) is Zero:
-#     return x
-#   else:
-#     return add_jaxvals(x, y)
-#
+def defbilinear(prim, lhs_rule, rhs_rule):
+  assert isinstance(prim, Primitive)
+  lhs_jvp = lambda g, x, y, **kwargs: prim.bind(g, y, **kwargs)
+  rhs_jvp = lambda g, x, y, **kwargs: prim.bind(x, g, **kwargs)
+  lhs_jvp.__name__ = lhs_jvp.__qualname__ = prim.name + '/' + lhs_rule.__name__
+  rhs_jvp.__name__ = rhs_jvp.__qualname__ = prim.name + '/' + rhs_rule.__name__
+  defjvp(prim, lhs_jvp, rhs_jvp)
+  transpose_rules[prim] = partial(bilinear_transpose, lhs_rule, rhs_rule)
+
+def bilinear_transpose(lhs_rule, rhs_rule, cotangent, x, y, **kwargs):
+  assert is_undefined_primal(x) ^ is_undefined_primal(y)
+  if type(cotangent) is Zero:
+    return Zero
+  if is_undefined_primal(x):
+    out = lhs_rule(cotangent, y, **kwargs)
+    return Zero if out is Zero else (out, None)
+  else:
+    out = rhs_rule(cotangent, x, **kwargs)
+    return Zero if out is Zero else (None, out)
+
+
+def defjvp(primitive, *jvprules):
+  assert isinstance(primitive, Primitive)
+  assert not primitive.multiple_results
+  jvp_rules[primitive] = partial(standard_jvp, jvprules, primitive)
+
+
+def standard_jvp(jvprules, primitive, primals, tangents, **params):
+  # breakpoint()
+  val_out, = primitive.bind(*primals, **params)
+  # breakpoint()
+  tangents_out = [rule(t, *primals, **params) for rule, t in zip(jvprules, tangents)
+                  if rule is not None and type(t) is not Zero]
+  return [val_out], [functools.reduce(add_tangents, tangents_out, Zero.from_value(val_out))]
+
+def defjvp2(primitive, *jvprules):
+  assert isinstance(primitive, Primitive)
+  assert not primitive.multiple_results
+  jvp_rules[primitive] = partial(standard_jvp2, jvprules, primitive)
+
+def standard_jvp2(jvprules, primitive, primals, tangents, **params):
+  val_out, = bind(primitive, *primals, **params)
+  tangents_out = (rule(t, val_out, *primals, **params) for rule, t in zip(jvprules, tangents)
+                  if rule is not None and type(t) is not Zero)
+  tangents_out = list(tangents_out)
+  breakpoint()
+  return val_out, functools.reduce(add_tangents, tangents_out, Zero.from_value(val_out))
+
+def add_tangents(x, y):
+  if type(x) is Zero:
+    return y
+  elif type(y) is Zero:
+    return x
+  else:
+    return add_jaxvals(x, y)
+
 # add_jaxvals = add
+
+jaxval_adders: Dict[type, Callable] = {}
+# jaxval_adders[Unit] = lambda _, __: unit
+
+abstract_unit = object()
+
+def add_jaxvals(x, y):
+  if core.get_aval(x) is core.abstract_unit is core.get_aval(y):
+    return core.unit
+  else:
+    return add_jaxvals_p.bind(x, y)
+
+add_jaxvals_p: Primitive = Primitive('add_any')
+add_any_p = add_jaxvals_p
+
+@add_jaxvals_p.def_impl
+def add_impl(xs, ys):
+  return jaxval_adders.get(type(xs), add)(xs, ys)
+
+@add_jaxvals_p.def_abstract_eval
+def add_abstract(xs, ys):
+  breakpoint()
+  return lattice_join(xs, ys)
+
 
 
 # -
@@ -711,18 +863,18 @@ y, ydot = jvp(f, (x,), (xdot,))
 print(y)
 print(ydot)
 
-# # +
-# class Zero:
-#   __slots__ = ['aval']
-#   def __init__(self, aval):
-#     self.aval = aval
-#   def __repr__(self):
-#     return 'Zero({})'.format(self.aval)
-#   @staticmethod
-#   def from_value(val):
-#     return Zero(raise_to_shaped(get_aval(val)))
-#
-# register_pytree_node(Zero, lambda z: ((), z.aval), lambda aval, _: Zero(aval))
+# +
+class Zero:
+  __slots__ = ['aval']
+  def __init__(self, aval):
+    self.aval = aval
+  def __repr__(self):
+    return 'Zero({})'.format(self.aval)
+  @staticmethod
+  def from_value(val):
+    return Zero(raise_to_shaped(get_aval(val)))
+
+register_pytree_node(Zero, lambda z: ((), z.aval), lambda aval, _: Zero(aval))
 
 
 # -
@@ -750,6 +902,8 @@ def move_batch_axis(axis_size, src, dst, x):
     return moveaxis(x, src, dst)
 
 def moveaxis(x, src: int, dst: int):
+  src = canonicalize_axis(src, np.ndim(x))
+  dst = canonicalize_axis(dst, np.ndim(x))
   perm = [i for i in range(np.ndim(x)) if i != src]
   perm.insert(dst, src)
   return transpose(x, perm)
@@ -771,7 +925,7 @@ def reduction_dims(a, axis):
   elif not isinstance(axis, (np.ndarray, tuple, list)):
     axis = (axis,)
   #canon_axis = tuple(_canonicalize_axis_allow_named(x, ndim(a))
-    canon_axis = tuple(canonicalize_axis(x, ndim(a))
+  canon_axis = tuple(canonicalize_axis(x, ndim(a))
                      for x in axis)
   if len(canon_axis) != len(set(canon_axis)):
     raise ValueError(f"duplicate value in 'axis': {axis}")
@@ -1193,7 +1347,7 @@ class JaxprTrace(Trace):
     return self.main.global_data
 
 # NB: in JAX, we instead attach abstract eval rules to Primitive instances
-abstract_eval_rules = {}
+#abstract_eval_rules = {}
 
 
 # -
@@ -1279,6 +1433,7 @@ def _inline_literals(jaxpr: Jaxpr, consts: List[Any]) -> Tuple[Jaxpr, List[Any]]
 # +
 def binop_abstract_eval(x: ShapedArray, y: ShapedArray) -> List[ShapedArray]:
   if not isinstance(x, ShapedArray) or not isinstance(y, ShapedArray):
+
     raise TypeError
   if raise_to_shaped(x).shape != raise_to_shaped(y).shape: raise TypeError
   dtype = np.find_common_type([], [x.dtype, y.dtype])
@@ -1870,6 +2025,7 @@ def xla_call_translation(c, in_avals, in_vals, *, jaxpr, num_consts):
   xla_params = _xla_params(subc, in_avals)
   outs = jaxpr_subcomp(subc, jaxpr, xla_params)
   subc = subc.build(xops.Tuple(subc, outs))
+  print(subc.
   return destructure_tuple(c, xops.Call(c, subc, in_vals))
 xla_translations[xla_call_p] = xla_call_translation
 
@@ -2582,6 +2738,8 @@ register_pytree_node(UndefPrimal,
                      lambda u: (u.aval, ()),
                      lambda aval, _: UndefPrimal(aval))
 
+def is_undefined_primal(x):
+  return type(x) is UndefPrimal
 
 # -
 
@@ -3106,7 +3264,7 @@ def pprint_cond(names: DefaultDict[Var, str], eqn: JaxprEqn) -> PPrint:
 pp_rules[cond_p] = pprint_cond
 
 
-del print
+# del print
 
 
 
@@ -3428,3 +3586,267 @@ def _broadcast_in_dim_batch_rule(batched_args, batch_dims, *, shape,
   new_broadcast_dimensions = (0,) + tuple(np.add(1, broadcast_dimensions))
   return broadcast_in_dim(new_operand, new_shape, new_broadcast_dimensions), 0
 vmap_rules[broadcast_in_dim_p] = _broadcast_in_dim_batch_rule
+
+
+
+def _dot_general_shape_rule(lhs, rhs, *, dimension_numbers, precision,
+                            preferred_element_type: Optional[DType]):
+  (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
+  if not all(np.all(np.greater_equal(d, 0)) and np.all(np.less(d, lhs.ndim))
+             for d in (lhs_contracting, lhs_batch)):
+    msg = ("dot_general requires lhs dimension numbers to be nonnegative and "
+           "less than the number of axes of the lhs value, got "
+           f"lhs_batch of {lhs_batch} and lhs_contracting of {lhs_contracting} "
+           f"for lhs of rank {lhs.ndim}")
+    raise TypeError(msg)
+  if not all(np.all(np.greater_equal(d, 0)) and np.all(np.less(d, rhs.ndim))
+             for d in (rhs_contracting, rhs_batch)):
+    msg = ("dot_general requires rhs dimension numbers to be nonnegative and "
+           "less than the number of axes of the rhs value, got "
+           f"rhs_batch of {rhs_batch} and rhs_contracting of {rhs_contracting} "
+           f"for rhs of rank {rhs.ndim}")
+    raise TypeError(msg)
+  if len(lhs_batch) != len(rhs_batch):
+    msg = ("dot_general requires equal numbers of lhs_batch and rhs_batch "
+           "dimensions, got lhs_batch {} and rhs_batch {}.")
+    raise TypeError(msg.format(lhs_batch, rhs_batch))
+  lhs_contracting_set, lhs_batch_set = set(lhs_contracting), set(lhs_batch)
+  rhs_contracting_set, rhs_batch_set = set(rhs_contracting), set(rhs_batch)
+  if len(lhs_batch_set) != len(lhs_batch):
+    msg = ("dot_general requires lhs batch dimensions to be distinct, got "
+           f"lhs_batch {lhs_batch}.")
+    raise TypeError(msg)
+  if len(rhs_batch_set) != len(rhs_batch):
+    msg = ("dot_general requires rhs batch dimensions to be distinct, got "
+           f"rhs_batch {rhs_batch}.")
+    raise TypeError(msg)
+  if len(lhs_contracting_set) != len(lhs_contracting):
+    msg = ("dot_general requires lhs contracting dimensions to be distinct, "
+           f"got lhs_contracting {lhs_contracting}.")
+    raise TypeError(msg)
+  if len(rhs_contracting_set) != len(rhs_contracting):
+    msg = ("dot_general requires rhs contracting dimensions to be distinct, "
+           f"got rhs_contracting {rhs_contracting}.")
+    raise TypeError(msg)
+  if lhs_contracting_set & lhs_batch_set:
+    msg = ("dot_general requires lhs batch dimensions to be disjoint from "
+           "contracting dimensions, got lhs_batch {} and lhs_contracting {}.")
+    raise TypeError(msg.format(lhs_batch, lhs_contracting))
+  if rhs_contracting_set & rhs_batch_set:
+    msg = ("dot_general requires rhs batch dimensions to be disjoint from "
+           "contracting dimensions, got rhs_batch {} and rhs_contracting {}.")
+    raise TypeError(msg.format(rhs_batch, rhs_contracting))
+  lhs_batch_shape = tuple(lhs.shape[i] for i in lhs_batch)
+  rhs_batch_shape = tuple(rhs.shape[i] for i in rhs_batch)
+  if not core.symbolic_equal_shape(lhs_batch_shape, rhs_batch_shape):
+    msg = ("dot_general requires lhs batch dimensions and rhs batch dimensions "
+           "to have the same shape, got {} and {}.")
+    raise TypeError(msg.format(lhs_batch_shape, rhs_batch_shape))
+  lhs_contracting_shape = tuple(lhs.shape[i] for i in lhs_contracting)
+  rhs_contracting_shape = tuple(rhs.shape[i] for i in rhs_contracting)
+  if not core.symbolic_equal_shape(lhs_contracting_shape, rhs_contracting_shape):
+    msg = ("dot_general requires contracting dimensions to have the same "
+           "shape, got {} and {}.")
+    raise TypeError(msg.format(lhs_contracting_shape, rhs_contracting_shape))
+
+  return _dot_general_shape_computation(lhs.shape, rhs.shape, dimension_numbers)
+abstract_eval_rules[dot_general_p] = _dot_general_shape_rule
+
+def _dot_general_shape_computation(lhs_shape, rhs_shape, dimension_numbers):
+  (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
+  batch_shape = tuple(lhs_shape[i] for i in lhs_batch)
+  lhs_contract_or_batch = tuple(sorted(tuple(lhs_contracting) + tuple(lhs_batch)))
+  lhs_tensored_shape = tuple_delete(lhs_shape, lhs_contract_or_batch)
+  rhs_contract_or_batch = tuple(sorted(tuple(rhs_contracting) + tuple(rhs_batch)))
+  rhs_tensored_shape = tuple_delete(rhs_shape, rhs_contract_or_batch)
+  return batch_shape + lhs_tensored_shape + rhs_tensored_shape
+
+def tuple_delete(tup, idx):
+  idx_ = set(idx)
+  return tuple(tup[i] for i in range(len(tup)) if i not in idx_)
+
+
+def _dot_general_transpose_lhs(g, y, *, dimension_numbers, precision,
+                               preferred_element_type: Optional[DType],
+                               swap_ans=False):
+  (x_contract, y_contract), (x_batch, y_batch) = dimension_numbers
+  x_ndim = g.ndim - y.ndim + len(x_batch) + 2 * len(x_contract)
+  x_kept = remaining(range(x_ndim), x_contract, x_batch)
+  y_kept = remaining(range(y.ndim), y_contract, y_batch)
+  if swap_ans:
+    ans_batch, ans_y, _ = ranges_like(x_batch, y_kept, x_kept)
+  else:
+    ans_batch, _, ans_y = ranges_like(x_batch, x_kept, y_kept)
+  dims = ((ans_y, y_kept), (ans_batch, y_batch))
+  x_contract_sorted_by_y = list(np.take(x_contract, np.argsort(y_contract)))  # type: ignore[arg-type]
+  out_axes = np.argsort(list(x_batch) + x_kept + x_contract_sorted_by_y)
+  return transpose(dot_general(g, y, dims, precision=precision, preferred_element_type=preferred_element_type),
+                   tuple(out_axes))
+
+def _dot_general_transpose_rhs(g, x, *, dimension_numbers, precision,
+                               preferred_element_type: Optional[DType]):
+  (x_contract, y_contract), (x_batch, y_batch) = dimension_numbers
+  swapped_dimension_numbers = ((y_contract, x_contract), (y_batch, x_batch))
+  return _dot_general_transpose_lhs(
+    g, x, dimension_numbers=swapped_dimension_numbers, precision=precision,
+    preferred_element_type=preferred_element_type,
+    swap_ans=True)
+
+
+def _dot_general_batch_rule(batched_args, batch_dims, *, dimension_numbers,
+                            precision,
+                            preferred_element_type: Optional[DType]):
+  lhs, rhs = batched_args
+  new_dimension_numbers, result_batch_dim = _dot_general_batch_dim_nums(
+      (lhs.ndim, rhs.ndim), batch_dims, dimension_numbers)
+  batched_out = dot_general(lhs, rhs, new_dimension_numbers,
+                            precision=precision,
+                            preferred_element_type=preferred_element_type)
+  return batched_out, result_batch_dim
+
+def _dot_general_batch_dim_nums(ndims, batch_dims, dimension_numbers):
+  # there are three kinds of dimensions in a dot_general:
+  # - contraction dimensions appear in lhs and rhs but not the result
+  # - batch dimensions appear in lhs, rhs, and result
+  # - tensor product dimensions appear in the result and one of lhs or rhs
+  lhs_ndim, rhs_ndim = ndims
+  lbd, rbd = batch_dims
+  assert lbd is not None or rbd is not None
+  (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
+
+  def bump_dims(dims, b):
+    return tuple(np.add(dims, np.greater_equal(dims, b)))
+
+  if lbd is not None and rbd is not None:
+    # adding a batch dimension
+    lhs_batch = (lbd,) + bump_dims(lhs_batch, lbd)
+    rhs_batch = (rbd,) + bump_dims(rhs_batch, rbd)
+    lhs_contract = bump_dims(lhs_contract, lbd)
+    rhs_contract = bump_dims(rhs_contract, rbd)
+    result_batch_dim = 0
+  else:
+    # adding a tensor product dimension
+    if lbd is not None:
+      other = tuple(d for d in range(lhs_ndim)
+                    if d not in lhs_batch and d not in lhs_contract)
+      result_batch_dim = (len(lhs_batch) + sum(np.less(other, lbd)))
+      lhs_batch = bump_dims(lhs_batch, lbd)
+      lhs_contract = bump_dims(lhs_contract, lbd)
+    else:
+      other = tuple(d for d in range(rhs_ndim)
+                    if d not in rhs_batch and d not in rhs_contract)
+      result_batch_dim = (lhs_ndim - len(lhs_contract) +
+                          sum(np.less(other, rbd)))
+      rhs_batch = bump_dims(rhs_batch, rbd)
+      rhs_contract = bump_dims(rhs_contract, rbd)
+
+  new_dimension_numbers = ((lhs_contract, rhs_contract), (lhs_batch, rhs_batch))
+  return new_dimension_numbers, int(result_batch_dim)
+
+
+defbilinear(dot_general_p, _dot_general_transpose_lhs, _dot_general_transpose_rhs)
+
+vmap_rules[dot_general_p] = _dot_general_batch_rule
+
+
+def _dot_general(lhs, rhs, *, dimension_numbers,
+                 precision: Optional[Tuple[PrecisionType, PrecisionType]],
+                 preferred_element_type: Optional[DType]):
+  """Implementation of lax.dot_general_p in terms of np.einsum."""
+  (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
+  lhs_ndim, rhs_ndim = len(lhs.shape), len(rhs.shape)
+
+  # This condition ensures that:
+  # 1) the batch dimensions are ordered in the same way in lhs and rhs (this is
+  #    not strictly necessary, but we would have to reshape the array if that
+  #    were not the case;
+  # 2) lhs and rhs have the same number of dimensions +/- 1
+  # 3) the number of non-batch dimensions in both tensors is either 1 or 2
+  # 4) the contracting dimensions are consistent with those of a classic
+  #    matrix/matrix, vector/matrix or matrix/vector multiplication.
+  if (lhs_batch == rhs_batch == tuple(range(len(lhs_batch))) and
+      lhs_ndim - rhs_ndim in [-1, 0, 1] and
+      1 <= lhs_ndim - len(lhs_batch) <= 2 and
+      1 <= rhs_ndim - len(rhs_batch) <= 2 and
+      lhs_contracting == (len(lhs.shape) - 1,) and
+      rhs_contracting == (len(lhs_batch),)):
+    # All the inputs to np.matmul must have 2 inner dimensions,
+    # after their batch dimensions, so we need to expand the dimensions
+    # appropriately. We can get to this branch with three combinations of
+    # inner shapes:
+    # - lhs.inner_shape == [a, b], rhs.inner_shape == [b, c]
+    #   - in this case, the resulting inner shape is [a, c];
+    # - lhs.inner_shape == [b]   , rhs.inner_shape == [b, c]
+    #   - in this case, we need to expand lhs to [1, b], and the resulting
+    #     shape is [c]. We need to squeeze the result of np.matmul
+    #     as it will have shape [1, c];
+    # - lhs.shape == [batch] + [a, b], rhs.shape == [batch] + [b]
+    #   - in this case, we need to expand rhs to [b, 1], and the resulting
+    #     shape is [a]. We need to squeeze the result of np.matmul
+    #     as it will have shape [a, 1];
+    # - lhs.shape == [batch] + [b]   , rhs.shape == [batch] + [b]
+    #   - in this case, we need to expand lhs to [1, b] and rhs to [b, 1],
+    #     and the resulting shape is (). We need to squeeze the result of
+    #     np.matmul as it will have shape [1, 1].
+    squeeze_idxs = []
+    if lhs_ndim - len(lhs_batch) == 1:
+      lhs = np.expand_dims(lhs, lhs_ndim - 1)
+      squeeze_idxs.append(len(lhs.shape) - 2)
+    if rhs_ndim - len(rhs_batch) == 1:
+      rhs = np.expand_dims(rhs, rhs_ndim)
+      squeeze_idxs.append(len(rhs.shape) - 1)
+    result = np.matmul(lhs, rhs)
+    if len(squeeze_idxs) != 0:
+      assert all([result.shape[i] == 1 for i in squeeze_idxs])
+      result = np.squeeze(result, squeeze_idxs)
+    return [result]
+
+  new_id = iter(string.ascii_letters)
+  lhs_axis_ids = [next(new_id) for _ in lhs.shape]
+  rhs_axis_ids = [next(new_id) for _ in rhs.shape]
+  lhs_out_axis_ids = lhs_axis_ids[:]
+  rhs_out_axis_ids = rhs_axis_ids[:]
+
+  for lhs_axis, rhs_axis in zip(lhs_contracting, rhs_contracting):
+    shared_id = next(new_id)
+    lhs_axis_ids[lhs_axis] = shared_id
+    rhs_axis_ids[rhs_axis] = shared_id
+    lhs_out_axis_ids[lhs_axis] = None  # type: ignore[call-overload]
+    rhs_out_axis_ids[rhs_axis] = None  # type: ignore[call-overload]
+
+  batch_ids = []
+  for lhs_axis, rhs_axis in zip(lhs_batch, rhs_batch):
+    shared_id = next(new_id)
+    lhs_axis_ids[lhs_axis] = shared_id
+    rhs_axis_ids[rhs_axis] = shared_id
+    lhs_out_axis_ids[lhs_axis] = None  # type: ignore[call-overload]
+    rhs_out_axis_ids[rhs_axis] = None  # type: ignore[call-overload]
+    batch_ids.append(shared_id)
+
+  not_none = lambda x: x is not None
+  out_axis_ids = list(
+      filter(not_none, batch_ids + lhs_out_axis_ids + rhs_out_axis_ids))
+  assert lhs.dtype == rhs.dtype
+  spec = "{},{}->{}".format("".join(lhs_axis_ids), "".join(rhs_axis_ids),
+                            "".join(out_axis_ids))
+  out = np.einsum(spec, lhs, rhs)
+  return [out]
+
+
+impl_rules[dot_general_p] = _dot_general
+
+def batch_matmul(lhs: Array, rhs: Array,
+                 precision: PrecisionLike = None) -> Array:
+  """Batch matrix multiplication."""
+  if _min(lhs.ndim, rhs.ndim) < 2:
+    raise ValueError('Arguments to batch_matmul must be at least 2D, got {}, {}'
+                     .format(lhs.ndim, rhs.ndim))
+  if lhs.ndim != rhs.ndim:
+    raise ValueError('Arguments to batch_matmul must have same ndim, got {}, {}'
+                     .format(lhs.ndim, rhs.ndim))
+  lhs_contract = (lhs.ndim - 1,)
+  rhs_contract = (rhs.ndim - 2,)
+  batch = tuple(range(lhs.ndim - 2))
+  return dot_general(lhs, rhs, ((lhs_contract, rhs_contract), (batch, batch)),
+                     precision=precision)
+
